@@ -1,0 +1,5 @@
+{
+  "extraPaths": [".", "lib"],
+  "stubPath": ".",
+  "pythonVersion": "3.12"
+}

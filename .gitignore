@@ -1,0 +1,9 @@
+plan/
+request/
+
+# The game's own API manual. Game content, not mine to redistribute, and 28 MB of it.
+docs/Code_*
+
+# Save-specific manifest the game owns and regenerates. Publishing one save's
+# manifest into someone else's save folder would only confuse their game.
+codeterraform-scripts.json

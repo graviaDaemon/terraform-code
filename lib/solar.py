@@ -5,7 +5,14 @@
 
 Base power (battery budget, power mode, breakers) is owned by
 lib/power.py, which runs from solar_1 and calls track_sun and
-check_output itself. Every other panel runs this loop.
+check_output itself. Every other panel runs this loop - including the
+panels at another outpost, whether or not their subnet is wired home.
+
+There is exactly one supervisor, not one per grid. power.mode,
+power.budget, power.shed and the power.ledger archive key are single
+global names, so a second power.run() would be a second writer on all
+four (house rule 4). A subnet with no consumers has nothing to supervise
+anyway: no load to measure, no breaker that would buy it anything.
 """
 
 import caps
@@ -28,7 +35,7 @@ def check_output(gen, clock):
         return
     if clock.get_time_of_day() in DARK:
         return
-    notify("Solar output very low in daylight", "warn")
+    notify(f"{gen.name}: solar output very low in daylight", "warn")
 
 
 def run(gen, interval=5):
@@ -38,8 +45,13 @@ def run(gen, interval=5):
     interval  seconds to sleep between passes
     """
     clock = get_component(CLOCK_ID)
+    outpost = caps.outpost_of(gen)
+    where = "unknown"
+    if outpost is not None:
+        where = outpost.id
     caps.report(f"Solar {gen.name} online", caps.common() + [
         ("clock", clock is not None),
+        ("outpost", where),
     ])
 
     while True:

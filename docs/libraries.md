@@ -39,6 +39,7 @@ caps.report("Smelter online", caps.common() + [("tier", caps.tier(self))])
 | `outposts(machine=None)` | That machine's own outpost, or every outpost owned when no machine is given. |
 | `buildings(type_id=None, machine=None)` | Building refs of a type across those outposts. `[]` is a real answer: none deployed. |
 | `building_types(machine=None)` | Distinct building type ids deployed, in discovery order. |
+| `capacity_line()` / `any_full()` / `watch_capacity()` | Each outpost's `buildings_used` against its soft threshold, said at startup and whenever it changes, and `warn` once an outpost is at or past it. The threshold throttles output rather than blocking deployment, which is why it is worth naming. |
 | `local_store(machine)` | A same-outpost store id for this machine's ports. Base Inventory at the home outpost, else a Warehouse, then a Storage Bin. Warns and returns `None` when the outpost has no store at all. |
 | `tier(machine)` | Installed Mk tier, or `1` for a machine that has no tiers. |
 | `degraded(machine)` | `True` while a Mk III pack is starved of its fluid; `False` for machines without tiers. |
@@ -233,13 +234,22 @@ tier's output.
 ## `lib/solar.py`
 
 Panel tracking. Base power is owned by `lib/power.py`, which runs on `solar_1` and
-calls the first two of these itself.
+calls the first two of these itself. Every other panel runs `solar.run(self)` —
+including the panels at another outpost, wired home or not.
 
 | Function | Purpose |
 | --- | --- |
 | `track_sun(gen, clock)` | Tilt to face the sun: 0° at zenith, 90° at the horizon. |
-| `check_output(gen, clock)` | Warn when daylight output has collapsed. Dusk and night are expected. |
-| `run(gen, interval=5)` | Track the sun forever. |
+| `check_output(gen, clock)` | Warn when daylight output has collapsed, naming the panel. Dusk and night are expected. |
+| `run(gen, interval=5)` | Track the sun forever, reporting the panel's outpost at startup. |
+
+**Why there is no second supervisor:** one supervisor per grid sounds right once
+`lib/power.py` reads a single grid, and it is wrong. `power.mode`, `power.budget`,
+`power.shed` and the `power.ledger` archive key are single global names, so a second
+`power.run()` is a second writer on all four. It would also supervise nothing: a power
+outpost's subnet is generators and batteries with no consumer on it, so there is no load
+to measure and no breaker whose flip buys that subnet a watt. When the power line lands,
+the two subnets become one grid and `solar_1` covers both (D-039).
 
 ## `lib/power.py`
 
@@ -264,7 +274,7 @@ It supervises **one grid** — the one its own panel sits on — not the planet.
 | `grid_anchor(grid)` | The grid's anchor id, or `None` when there is no grid to name. |
 | `supply(control, grid)` | The figures to budget from: this grid's, or `control.total()` with a one-time warning. Both carry the same generation/consumption/storage fields. |
 | `scope_to(grid)` / `on_grid(machine_id)` | Limit `machines_of()` to this grid's machines. |
-| `other_grids(control, anchor)` / `watch_grids(control, anchor, seen)` | Name every grid this supervisor is not managing, at startup and whenever that set changes. |
+| `other_grids(control, anchor)` / `describe_grid(grid)` / `watch_grids(control, anchor, seen)` | Name every grid this supervisor is not managing — with its stored, capacity and net, since nothing else reads an unwired subnet — at startup and whenever that set changes. Change is judged on membership and `has_generator`, never on the live figures, which move every pass. |
 
 **Why not `control.total()`:** the manual defines it as "a planet-wide `PowerSummary`
 across every independent grid". With one grid that is right by accident. The moment a
@@ -682,15 +692,18 @@ that is where material already spent is sitting.
 | `status(pioneer, state, target=None, extra=None)` | This Pioneer's live status, delegated to `vehicle.report`. States are `idle`, `loading`, `driving`, `constructing`, `returning`, `waiting_for_charge`, `blocked`, `stranded`. |
 | `do_job(pioneer, job)` | Load, drive, park, build. `True` only when the job actually finished. `wrong_position` re-approaches harder — arrival tolerance means close enough, not stopped; `insufficient_materials` goes home and reloads once; transient statuses come back next pass. |
 
-### Founding and capacity
+### Founding
 
 | Function | Purpose |
 | --- | --- |
 | `outpost_at(x, y, tolerance=30)` | An owned outpost already standing there, or `None`. |
 | `outpost_ghosts()` | Every queued outpost blueprint, at any stage of being built. |
 | `found_outpost(x, y)` | Queue the outpost ghost and return its blueprint id. Planning needs no vehicle at the site. Refuses while an unbuilt outpost is queued and says nothing once one stands there, so a restart cannot spend a second kit. |
-| `capacity_line()` / `watch_capacity()` | Each outpost's `buildings_used` against its soft threshold, said at startup and whenever it changes. The threshold throttles output rather than blocking deployment, which is why it is worth naming. |
 | `run(pioneer, interval=10)` | Build whatever is queued, forever. A Pioneer with no Constructor Module says so and stops rather than idling on a queue it can never work. |
+
+The capacity line it used to own now lives in `lib/caps.py`, and `pioneer.run()` calls it
+from there — the supervisor watches the same number, so it is reported by something that is
+always running rather than only by a Pioneer that may be parked.
 
 ---
 

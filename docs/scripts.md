@@ -90,6 +90,17 @@ Runs on a solar generator. Calls `solar.run(self)`.
 Tilts the panel to face the sun and warns when daylight output has collapsed. Base
 power is supervised from `solar_1`; these panels only track.
 
+### `solar_6.py` … `solar_14.py`
+
+Runs on a solar generator at the **power outpost**. Calls `solar.run(self)`.
+
+Identical to the panels above, deliberately: there is no second supervisor at a second
+outpost. Until the power line is built the outpost is its own subnet, which `solar_1`
+reports as an unmanaged grid — with what it is storing — rather than spending; afterwards
+the two are one grid and these scripts do not change. Nine panels beside nine Small
+Batteries fill 18 of the outpost's 20 building slots, and the supervisor now says that
+count out loud whenever it moves.
+
 ## Vehicles
 
 ### `rover_1.py`, `rover_2.py`

@@ -35,7 +35,12 @@ ARCHIVE_ID = "notebook"
 # find_home() when the script starts. Docked means parked inside the
 # outpost footprint plus a ~2 m margin, and a vehicle parked 3 m short of
 # that footprint waits for a charge that never comes.
-HOME = {"x": 0, "y": 0, "id": "origin"}
+#
+# "id" is the charging STATION; "outpost" is the outpost that station
+# stands on, which is what fleet telemetry reports in `.docked_at`. The
+# two are separate because docked somewhere is not docked HERE, and
+# telling those apart is the whole of D-040.
+HOME = {"x": 0, "y": 0, "id": "origin", "outpost": None}
 
 # Arrival tolerance. The docs say a loop needs > 2 rather than exact zero.
 ARRIVE_TOLERANCE = 3.0
@@ -160,6 +165,7 @@ def find_home(vehicle):
         HOME["x"] = nearest.position[0]
         HOME["y"] = nearest.position[1]
         HOME["id"] = nearest.id
+        HOME["outpost"] = nearest.outpost_id
         return
 
     network = caps.component("outpost_network")
@@ -169,34 +175,101 @@ def find_home(vehicle):
         HOME["x"] = coords[0]
         HOME["y"] = coords[1]
         HOME["id"] = outpost.id
+        HOME["outpost"] = outpost.id
         notify("No Vehicle Charging Station found - homing on the outpost"
                " anchor instead", "warn")
         return
 
+    HOME["outpost"] = None
     notify("No outpost network readable - homing on (0, 0)", "warn")
 
 
-def docked_status(vehicle):
-    """The outpost's own verdict on whether this vehicle is docked.
-
-    This is the exact flag the charging station's manager gates on, read
-    from fleet telemetry. None when it cannot be read, in which case the
-    caller falls back to distance.
-    """
+def fleet_ref(vehicle):
+    """This vehicle's own entry in the fleet snapshot, or None."""
     component = get_component(FLEET_ID)
     if component is None:
         return None
     for ref in component.vehicles():
         if ref.id == vehicle.id:
-            return ref.is_docked
+            return ref
     return None
 
 
+def docked_status(vehicle):
+    """The outpost's own verdict on whether this vehicle is docked ANYWHERE.
+
+    This is the exact flag the charging station's manager gates on, read
+    from fleet telemetry. None when it cannot be read. It is the honest
+    answer to "is this thing parked", which is not the same question as
+    "is it parked at home" - see docked_home().
+    """
+    ref = fleet_ref(vehicle)
+    if ref is None:
+        return None
+    return ref.is_docked
+
+
+def docked_outpost(vehicle):
+    """The id of the outpost this vehicle is parked at, or None."""
+    ref = fleet_ref(vehicle)
+    if ref is None or not ref.is_docked:
+        return None
+    if ref.docked_at == "":
+        return None
+    return ref.docked_at
+
+
+def docked_home(vehicle):
+    """True, False, or None: is this vehicle docked at HOME's outpost?
+
+    None means the question cannot be answered from telemetry - no fleet
+    component, no snapshot for this vehicle, an unresolved HOME outpost,
+    or a docked flag with no outpost id beside it - and the caller falls
+    back to distance rather than guessing either way.
+
+    `.is_docked` alone means parked at AN outpost. A constructor that
+    founds one 344 m out and parks inside its footprint reads as docked
+    there, and reading that as home is what strands it (D-040).
+    """
+    ref = fleet_ref(vehicle)
+    if ref is None:
+        return None
+    if not ref.is_docked:
+        return False
+    if HOME["outpost"] is None or ref.docked_at == "":
+        return None
+    return ref.docked_at == HOME["outpost"]
+
+
+# Foreign outposts already reported, so a long drive home does not say
+# the same thing every pass.
+foreign = {"outposts": []}
+
+
+def foreign_dock_warning(vehicle):
+    """Parked at an outpost that is not home - say so once per outpost.
+
+    Silence is what made this expensive: the constructor parked inside
+    the outpost it had just built, read itself as home, and sat there
+    reporting `idle` for the rest of the day (D-040).
+    """
+    where = docked_outpost(vehicle)
+    if where is None or where == HOME["outpost"]:
+        return
+    if where in foreign["outposts"]:
+        return
+    foreign["outposts"].append(where)
+    notify(f"{vehicle.name} is docked at {where}, not at"
+           f" {HOME['outpost']} - heading back", "warn")
+
+
 def at_home(vehicle, tolerance=HOME_TOLERANCE):
-    """True when this vehicle counts as docked, or is within HOME_TOLERANCE
-    of the docking point if docking cannot be read."""
-    docked = docked_status(vehicle)
+    """True when this vehicle is docked at HOME's own outpost, or is within
+    HOME_TOLERANCE of the docking point if docking cannot be read."""
+    docked = docked_home(vehicle)
     if docked is not None:
+        if not docked:
+            foreign_dock_warning(vehicle)
         return docked
     return vehicle.nav.get_distance_to(HOME["x"], HOME["y"]) <= tolerance
 
@@ -271,7 +344,7 @@ def go_home(vehicle, throttle=RETURN_THROTTLE, tolerance=HOME_TOLERANCE,
         return False
 
     sleep(1)                       # telemetry is a snapshot; let it see us parked
-    if docked_status(vehicle) is False:
+    if docked_home(vehicle) is False:
         undocked_warning(vehicle, warn_after)
         sleep(idle)
         return False
@@ -396,6 +469,7 @@ def report(vehicle, state, target=None, extra=None):
         "x": position.x,
         "y": position.y,
         "docked": docked_status(vehicle),
+        "docked_at": docked_outpost(vehicle),
         "home": HOME["id"],
         "target": target,
     }

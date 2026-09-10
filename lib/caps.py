@@ -86,6 +86,53 @@ def building_types(machine=None):
     return seen
 
 
+capacity = {"line": ""}
+
+
+def capacity_line() -> str:
+    """Each outpost's building count against its soft threshold.
+
+    The threshold does not block deployment - it throttles productive and
+    service output at every counted building above it (D-021). That makes
+    it a number worth naming out loud rather than a limit that announces
+    itself later by making everything slower.
+    """
+    network = component(NETWORK_ID)
+    if network is None:
+        return "no outpost network"
+    parts = []
+    for outpost in network.outposts():
+        over = ""
+        if outpost.is_full:
+            over = " OVER"
+        parts.append(f"{outpost.id} {outpost.buildings_used}/"
+                     f"{outpost.buildings_capacity}{over}")
+    return ", ".join(parts)
+
+
+def any_full() -> bool:
+    """True when any outpost is at or past its soft threshold."""
+    network = component(NETWORK_ID)
+    if network is None:
+        return False
+    for outpost in network.outposts():
+        if outpost.is_full:
+            return True
+    return False
+
+
+def watch_capacity():
+    """Say the capacity line at startup and whenever it changes."""
+    line = capacity_line()
+    if line == capacity["line"]:
+        return
+    capacity["line"] = line
+    if any_full():
+        notify(f"Outpost capacity: {line}", "warn")
+    else:
+        notify(f"Outpost capacity: {line}")
+
+
 def local_store(machine):
     """A same-outpost store id for this machine's ports, or None.
 

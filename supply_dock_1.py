@@ -14,7 +14,7 @@ if LOCAL is not None and LOCAL not in CRATES:
 # Segment recipe, which is what unblocks wiring outpost 2 into the home
 # grid (D-022). Set to None to let the dock rank orders by progress and
 # reward on its own again.
-PREFER = "vestibule_logistics"
+PREFER = None
 
 # prefer_weekly=True weighs expiring weekly orders ahead of campaign ones.
 # Weekly progress is lost entirely when the board refreshes every 7 days.

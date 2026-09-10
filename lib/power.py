@@ -330,16 +330,27 @@ def on_grid(machine_id) -> bool:
 
 
 def other_grids(control, anchor):
-    """Every grid this supervisor is not managing, named and described."""
+    """Every PowerGrid this supervisor is not managing."""
     others = []
     for grid in control.grids():
         if grid.anchor_id == anchor:
             continue
-        generation = "has a generator"
-        if not grid.has_generator:
-            generation = "no generator"
-        others.append(f"{grid.anchor_id} ({generation})")
+        others.append(grid)
     return others
+
+
+def describe_grid(grid) -> str:
+    """One unmanaged grid, including the energy this supervisor cannot reach.
+
+    The stored figure is the only evidence an unwired power outpost is
+    working: no script reads that subnet, and its panels have no
+    consumers there to prove themselves against (D-022).
+    """
+    generation = "has a generator"
+    if not grid.has_generator:
+        generation = "no generator"
+    return (f"{grid.anchor_id} ({generation}, {round(grid.stored)} of"
+            f" {round(grid.capacity)} Wh, net {round(grid.net, 1)} W)")
 
 
 def watch_grids(control, anchor, seen):
@@ -348,19 +359,28 @@ def watch_grids(control, anchor, seen):
     An unwired outpost is a separate subnet whose energy this base cannot
     reach and whose machines it cannot relieve. It should be a line in
     the log, not a silence.
+
+    Change is judged on membership and generation, never on the live
+    figures - they move every pass, and a report that fires every pass is
+    telemetry, not a notification.
     """
     others = other_grids(control, anchor)
-    if others == seen["others"]:
+    names = []
+    described = []
+    for grid in others:
+        names.append(f"{grid.anchor_id}/{grid.has_generator}")
+        described.append(describe_grid(grid))
+    if names == seen["others"]:
         return
-    seen["others"] = others
+    seen["others"] = names
     where = anchor
     if where is None:
         where = "planet-wide fallback"
-    if len(others) == 0:
+    if len(names) == 0:
         notify(f"Power: supervising {where} - 1 grid, 0 unmanaged")
         return
-    notify(f"Power: supervising {where} - {len(others)} unmanaged grid(s): "
-           + ", ".join(others), "warn")
+    notify(f"Power: supervising {where} - {len(names)} unmanaged grid(s): "
+           + ", ".join(described), "warn")
 
 
 # --- breakers -----------------------------------------------------------
@@ -626,6 +646,7 @@ def run(gen, interval=INTERVAL):
         ("to restore", len(record)),
         ("unmanaged types", unmanaged_types()),
     ])
+    caps.watch_capacity()
 
     restore_all(control, record)
     save_shed(record)
@@ -637,6 +658,7 @@ def run(gen, interval=INTERVAL):
         grid = resolve_grid(control, gen)
         scope_to(grid)
         watch_grids(control, grid_anchor(grid), grids)
+        caps.watch_capacity()
 
         summary = supply(control, grid)
         account(ledger, summary, clock)

@@ -2,7 +2,7 @@
 
 A complete, running base written in the game's Python subset: terraforming, power,
 mining, smelting, freight and the biology loop, plus the contract puzzles. Wherever
-several machines run the same loop, that loop lives in one of sixteen shared libraries
+several machines run the same loop, that loop lives in one of twenty-one shared libraries
 under `lib/` and the machine script is three lines.
 
 The scripts are written to survive the whole campaign unchanged. Nothing hardcodes a
@@ -68,22 +68,28 @@ stopping one degrades the base rather than hanging it.
 | `earth.demand` | `supply_dock_1` | `{item_id: units}` Earth is still waiting for |
 | `bio.wanted` | `bio_exchange_1` | fragment ids some open Bio Order still has room for |
 | `terraform.heater_table` | any heater | learned `{thermal_state: watts}` |
-| `rover.status:<id>` | each rover | state, battery, cargo, position, docked, target |
+| `vehicle.status:<id>` | each vehicle | state, battery, position, docked, home, target, plus what only that kind has |
 | `rover.claim:<site_id>` | each rover | the rover id working that deposit |
 | `bio.*.status` | the three bio machines | heartbeats |
 
 Where staleness matters, readers use an aged read and treat an old value as no value.
 A publisher that stops therefore releases the base rather than freezing it: no
-`power.mode` means full power, and no `earth.demand` means reserve nothing.
+`power.mode` means full power.
+
+Two channels are heartbeats for a machine the supervisor can switch off, and switching
+a machine off *pauses its script*. Silence there means "nobody is publishing", never
+"nothing is wanted", so both have a fallback that reads the source directly: a stale
+`bio.wanted` sends the supervisor to the Exchange's own order list, and a stale
+`earth.demand` sends `lib/recipes.py` to the Earth Order board.
 
 ### Data Archive keys
 
 | Key | Written by | Holds |
 | --- | --- | --- |
-| `power.ledger` | `lib/power.py` | measured night length, night load, day generation |
+| `power.ledger` | `lib/power.py` | the grid it was measured on, plus night length, night load and day generation |
 | `power.shed` | `lib/power.py` | machines switched off, so a restart can restore them |
 | `rover.sites` | `lib/rover.py` | every surveyed mineral site, and whether it is worked out |
-| `rover.wh_per_meter` | `lib/rover.py` | learned drive cost, used to decide range |
+| `vehicle.wh_per_meter:<id>` | `lib/vehicle.py` | learned drive cost per vehicle, used to decide range |
 | `terraform.heater_optimal` | `lib/terraform.py` | the power setting that reads 100% per thermal state |
 
 ## Installing into your own save

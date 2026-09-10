@@ -51,12 +51,54 @@ def score_order(order):
     return value
 
 
-def pick_order(crates, prefer_weekly=False):
+def matches(order, prefer) -> bool:
+    """True when `prefer` names this order, its contractor, or its reward.
+
+    One string covers every way a human refers to an order: the order id,
+    the contractor id or display name, the order name, or the reward
+    label. Matched case-insensitively as a substring, so
+    `"vestibule"` and `"vestibule_logistics"` both work.
+    """
+    if prefer is None or prefer == "":
+        return False
+    wanted = prefer.lower()
+    for field in [order.id, order.name, order.contractor_id,
+                  order.contractor_name, order.reward_label]:
+        if field is not None and wanted in field.lower():
+            return True
+    return False
+
+
+def preferred(prefer, prefer_weekly=False):
+    """The open order the operator asked for, or None.
+
+    The three contractors each expose their current order at the same
+    time, so a named one is available NOW - there is nothing to wait out.
+    Feedability is deliberately not checked: assigning an order we cannot
+    fill yet is exactly how the rest of the base is told to go fill it,
+    through the `earth.demand` broadcast (D-025, D-028).
+    """
+    for order in earth.available_orders(prefer_weekly):
+        if matches(order, prefer):
+            return order
+    return None
+
+
+def pick_order(crates, prefer_weekly=False, prefer=None):
     """The best open order we can actually make progress on, or None.
 
-    Prefers an order with something already in the crates, because an
-    order we cannot feed is a dock sitting idle with an assignment.
+    An operator preference wins outright: `score_order` ranks on progress
+    already shipped, which is right when nothing else is asked for and
+    wrong the moment a specific reward is being chased.
+
+    Otherwise prefers an order with something already in the crates,
+    because an order we cannot feed is a dock sitting idle with an
+    assignment.
     """
+    wanted = preferred(prefer, prefer_weekly)
+    if wanted is not None:
+        return wanted
+
     best = None
     best_score = 0
     fallback = None
@@ -106,6 +148,60 @@ def assign(dock_machine, order) -> bool:
     return False
 
 
+def drain(dock_machine, crates) -> bool:
+    """Eject every loaded slot back into local storage. True when empty.
+
+    Dock cargo is physical and `set_order` refuses to reassign around it.
+    `eject()` recovers it; `flush()` would destroy it, which is never the
+    right answer for material the base spent ore and power making.
+    """
+    for slot in dock_machine.slots():
+        if slot.item_id is None or slot.count <= 0:
+            continue
+
+        sink = storage.sink_for(crates, slot.item_id, slot.count)
+        if sink is None:
+            notify(f"Supply Dock holds {slot.count} x {slot.item_id} and"
+                   f" nowhere local will take it back - free a bin or"
+                   f" Inventory space before switching orders", "warn")
+            return False
+
+        out = dock_machine.input.eject(sink, slot.item_id, slot.count)
+        if out.status not in ["ok", "partial", "no_op"]:
+            notify(f"Supply Dock eject {slot.item_id} -> {sink}:"
+                   f" {out.message}", "warn")
+            return False
+
+    return dock_machine.total() <= 0
+
+
+def switch(dock_machine, order, crates) -> bool:
+    """Move an already-assigned dock onto `order`. True when it took.
+
+    Safe for campaign orders and only for those: `.shipped` is shared and
+    permanent, so units already sent to the order being left behind stay
+    credited and are there when it is picked up again. A weekly loses
+    everything shipped at the next board refresh, so one is never
+    abandoned here.
+    """
+    active = dock_machine.current_order()
+    if active is None:
+        return assign(dock_machine, order)
+    if active.id == order.id:
+        return True
+    if active.kind == "weekly":
+        return False
+
+    notify(f"Supply Dock switching from {active.name} to {order.name}")
+    released = dock_machine.clear_order()
+    if released.status != "ok":
+        notify(f"clear_order: {released.message}", "warn")
+        return False
+    if not drain(dock_machine, crates):
+        return False
+    return assign(dock_machine, order)
+
+
 def load(dock_machine, order, crates) -> int:
     """Pull what the order still needs out of the crate bank.
 
@@ -152,13 +248,20 @@ def enable(dock_machine):
         notify(f"set_enabled: {result.message}", "warn")
 
 
-def run(dock_machine, crates, prefer_weekly=False, interval=10):
+def run(dock_machine, crates, prefer_weekly=False, prefer=None, interval=10):
     """Serve Earth Orders from the crate bank, forever.
 
     dock_machine   the Supply Dock this script runs inside - pass `self`
     crates         bin ids to load from
     prefer_weekly  weigh expiring weekly orders ahead of campaign ones
+    prefer         name, id or contractor of the order to chase, or None
+                   to let score_order decide
     interval       seconds between passes
+
+    The startup line reports `units/h` against a base rate of 25. Anything
+    lower and no throughput research is unlocked means this outpost is
+    over its soft building threshold and the overcrowding penalty is
+    already being paid (D-021).
     """
     if not ports.require_feeders("Supply Dock"):
         return
@@ -166,12 +269,29 @@ def run(dock_machine, crates, prefer_weekly=False, interval=10):
     caps.report("Supply Dock online", caps.common() + [
         ("crates", crates),
         ("units/h", dock_machine.dispatch_rate()),
+        ("prefer", prefer),
     ])
+
+    if prefer is not None and preferred(prefer, prefer_weekly) is None:
+        notify(f"Supply Dock: no open order matches \"{prefer}\" - falling"
+               f" back to picking by progress and reward", "warn")
 
     announced = ""
 
     while True:
         active = dock_machine.current_order()
+
+        # An assignment does not expire, so a preference set after the
+        # dock latched onto something else would otherwise never take
+        # effect. Campaign progress is shared and permanent, so the order
+        # being left behind keeps every unit already shipped to it.
+        if active is not None and not matches(active, prefer):
+            wanted = preferred(prefer, prefer_weekly)
+            if wanted is not None:
+                if not switch(dock_machine, wanted, crates):
+                    sleep(IDLE_INTERVAL)
+                    continue
+                active = dock_machine.current_order()
 
         # current_order() flips to None on completion or weekly expiry, and
         # dispatch is disabled with it - so the script has to choose again
@@ -183,7 +303,7 @@ def run(dock_machine, crates, prefer_weekly=False, interval=10):
 
             earth.publish_demand(None)
 
-            target = pick_order(crates, prefer_weekly)
+            target = pick_order(crates, prefer_weekly, prefer)
             if target is None:
                 sleep(IDLE_INTERVAL)
                 continue

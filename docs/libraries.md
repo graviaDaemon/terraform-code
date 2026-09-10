@@ -1,6 +1,6 @@
 # Library reference
 
-Sixteen in-game Libraries. Machine scripts import them by name; libraries import each
+Twenty-one in-game Libraries. Machine scripts import them by name; libraries import each
 other the same way. No library ever touches `self` — the machine is passed in.
 
 Functions prefixed with `_` are internal and omitted here.
@@ -9,10 +9,12 @@ Functions prefixed with `_` are internal and omitted here.
 [ports](#libportspy) · [storage](#libstoragepy) · [comms](#libcommspy) ·
 [grid](#libgridpy)
 
-**Domain arithmetic** — [bio](#libbiopy) · [earth](#libearthpy)
+**Domain arithmetic** — [bio](#libbiopy) · [earth](#libearthpy) ·
+[recipes](#librecipespy) · [survey](#libsurveypy)
 
 **Machine controllers** — [terraform](#libterraformpy) · [solar](#libsolarpy) ·
-[power](#libpowerpy) · [fleet](#libfleetpy) · [rover](#libroverpy) ·
+[power](#libpowerpy) · [fleet](#libfleetpy) · [vehicle](#libvehiclepy) ·
+[rover](#libroverpy) · [scout](#libscoutpy) · [pioneer](#libpioneerpy) ·
 [smelting](#libsmeltingpy) · [dock](#libdockpy)
 
 ---
@@ -56,7 +58,7 @@ silently never receives anything.
 
 | Function | Purpose |
 | --- | --- |
-| `rover_channel(rover_id)` | Per-vehicle status channel, `rover.status:rover_1`. |
+| `vehicle_channel(vehicle_id)` | Per-vehicle status channel, `vehicle.status:rover_1`. |
 | `claim_channel(site_id)` | Per-site mining claim channel, `rover.claim:<site id>`. |
 | `comms()` | The Signal Bus component, or `None` before that research. |
 | `publish(channel, value)` | Broadcast a value. `True` when it landed. Publishing also resets the channel's age, so a loop that publishes each pass doubles as that script's heartbeat. |
@@ -178,6 +180,37 @@ unfinished weekly is lost at refresh.
 | `demand()` | `{item_id: units}` currently wanted, or `{}` when there is no dock, no bus, or the broadcast has gone stale. |
 | `wanted_by_earth(item_id)` | Whether a live order still needs that item. |
 
+## `lib/recipes.py`
+
+The recipe graph: what the base must **mine** to fill what Earth ordered. An Earth
+Order only ever asks for finished goods, and a mineral site's `item_id` is only ever
+one of seven raw ores, so "Earth wants 150 `iron_ingot`" and "drive to an `iron_ore`
+deposit" never matched on their own. This walks `Recipe.output_item` back to
+`Recipe.inputs` until nothing wanted is something the base could make for itself.
+
+Nothing is hardcoded to smelters or to iron: any deployed building that answers
+`list_recipes()` joins the graph, and a blueprint unlocked today joins it on the next
+re-probe.
+
+| Function | Purpose |
+| --- | --- |
+| `machines()` | `(machine_id, component)` for every deployed building that has recipes — discovered by asking, since anything that raises is simply not a crafting machine. |
+| `table()` | `{output_item: [(machine_id, recipe)]}` across those machines. Cached, re-probed on a slow counter. |
+| `producers(item_id)` | The unlocked pairs that make that item. `[]` is how a raw material identifies itself. |
+| `live_demand()` | `{item_id: units}` of **finished goods** Earth wants. The dock's broadcast while it is running, the order board read directly when it is not. |
+| `raw_demand()` | `{item_id: units}` of **mineable** material the base needs. What `rover.best_site()` scores against. |
+| `best_recipe(machine, wanted)` | The recipe on that machine whose output is most wanted, or `None`. Picks what to *make*, where `raw_demand()` picks what to *mine*. |
+
+**Why the board fallback is not optional:** `set_powered(id, False)` pauses the
+machine's script. The moment the supervisor conserve-sheds the Supply Dock, the
+`earth.demand` channel goes stale within a minute — so silence there means "nobody is
+publishing", never "nothing is wanted". Same shape, and the same reason, as the dark
+Exchange in [power](#libpowerpy).
+
+**The plural name is deliberate:** `recipe` and `recipe_id` are parameter names all
+through [smelting](#libsmeltingpy), and a library whose name a parameter shadows
+cannot be reached from inside the functions that use it.
+
 ## `lib/terraform.py`
 
 Controllers for the three terraforming tracks. `set_power`, `set_intake`, `sync` and
@@ -219,6 +252,27 @@ energy bridges the dark hours.
 Learned state is written to the Data Archive when it exists and to the Signal Bus
 otherwise, so the supervisor works before that research and improves after it.
 
+It supervises **one grid** — the one its own panel sits on — not the planet.
+
+### The grid
+
+| Function | Purpose |
+| --- | --- |
+| `resolve_grid(control, gen)` | The `PowerGrid` this panel sits on. `None` is a normal answer for a mobile, under-construction, non-grid or unmapped target. |
+| `grid_anchor(grid)` | The grid's anchor id, or `None` when there is no grid to name. |
+| `supply(control, grid)` | The figures to budget from: this grid's, or `control.total()` with a one-time warning. Both carry the same generation/consumption/storage fields. |
+| `scope_to(grid)` / `on_grid(machine_id)` | Limit `machines_of()` to this grid's machines. |
+| `other_grids(control, anchor)` / `watch_grids(control, anchor, seen)` | Name every grid this supervisor is not managing, at startup and whenever that set changes. |
+
+**Why not `control.total()`:** the manual defines it as "a planet-wide `PowerSummary`
+across every independent grid". With one grid that is right by accident. The moment a
+second outpost exists and is not yet wired, it pools solar and batteries this base
+physically cannot reach into the night budget and skips conserving on a night it
+should have — and a subnet that cannot fund a tick pauses *every* live consumer on it.
+Shedding has the same flaw: `caps.buildings()` spans every outpost, so the supervisor
+would flip breakers on machines that are not on its grid and get no relief. An unwired
+outpost should be a line in the log, not a silence.
+
 ### Ledger and budget
 
 | Function | Purpose |
@@ -238,7 +292,7 @@ otherwise, so the supervisor works before that research and improves after it.
 
 | Function | Purpose |
 | --- | --- |
-| `machines_of(type_ids)` | `[(id, type_id)]` across every outpost, in the order given. |
+| `machines_of(type_ids)` | `[(id, type_id)]` on this supervisor's grid, in the order given. |
 | `unmanaged_types()` | Deployed types this supervisor neither sheds nor guards. Reported at startup so a new machine type is added deliberately rather than left running through a critical night. |
 | `wants_shed(mode, type_id)` | Whether this mode sheds that type. |
 | `switch_off(control, machine_id, reason)` / `switch_on(control, machine_id, reason)` | Flip one breaker, with the outcome named. |
@@ -252,12 +306,18 @@ back on by its own rule rather than by the mode pass.
 
 | Function | Purpose |
 | --- | --- |
-| `smelter_idle(smelter)` | Idle when no bin anywhere holds any input. A smelter with no recipe set is never judged idle — with no inputs, "no bin holds any input" is vacuously true and it could never come back. |
+| `smelter_idle(smelter)` | Idle only when no bin anywhere holds an input of **any unlocked recipe**, not just the latched one. A smelter with no recipe set is never judged idle — with no inputs, "no bin holds any input" is vacuously true and it could never come back. |
 | `dock_idle(dock)` | Idle when there is no active order and none available. |
 | `wanted_fragments()` | Wanted fragment ids, from the bus while the Exchange publishes, read directly once that goes stale. A dark Exchange stops publishing, so the bus alone can never say the orders returned. |
 | `bio_idle()` | Idle only after the wanted list has been empty for many consecutive passes. |
 | `idle_verdict(machine_id, type_id, bio_verdict)` | `True` idle, `False` has work, `None` cannot tell — and `None` holds the current state. |
 | `idle_pass(control, record, mode)` | Apply the idle rules once. |
+
+**Why the smelter rule judges every recipe:** the smelter picks its recipe from live
+demand now. Judging only the latched one deadlocks — a smelter that latches titanium
+with no titanium ore in the bins is judged idle, gets its breaker pulled, and its own
+script, the only thing that would ever re-read demand and switch back, is paused with
+it. Staying powered whenever there is anything to convert is also the safer direction.
 
 ### Entry point
 
@@ -287,23 +347,35 @@ express: a vehicle's own **intent**.
 | `watch_bays(station, bays)` | Re-read bay count and rate each pass, so an upgrade applied mid-run is announced. |
 | `run(station, interval=10)` | Charge and rescue forever. |
 
-## `lib/rover.py`
+## `lib/vehicle.py`
 
-Prospecting and mining: sweep, survey, drive, drill, return. One script per rover
-rather than machines coordinating, because nav, sonar and drill are all modules on the
-vehicle.
+Drive, park, dock, and never strand yourself — for every ground vehicle. A Rover, a
+scouting Pioneer and a constructing Pioneer are the same thing from this file's point
+of view, because everything here touches only `nav`, `battery` and fleet telemetry.
 
-The rule the whole file is built around: **get near, park, then work.** Reaching
+The rule the whole layer is built around: **get near, park, then work.** Reaching
 tolerance means close enough, not stopped, so `nav.brake()` comes before every scan,
 survey, drill or transfer.
+
+Every fraction and tolerance is a module constant **and** a default argument
+(`RESERVE_FRACTION`, `STRANDED_FRACTION`, `DEPART_FRACTION`, `CRUISE_THROTTLE`,
+`RETURN_THROTTLE`, `ARRIVE_TOLERANCE`, `HOME_TOLERANCE`, `STALL_LIMIT`,
+`IDLE_INTERVAL`, `CHARGE_WARN_AFTER`), because the Pioneer's are not the Rover's.
 
 ### Range and drive cost
 
 | Function | Purpose |
 | --- | --- |
-| `drain_per_meter()` | Learned Wh per metre, or a pessimistic default. Wrong high brings the rover home early; wrong low strands it. |
-| `record_drain(wh_used, meters)` | Fold one observed trip into the running estimate. |
-| `can_reach_and_return(vehicle, x, y)` | Whether the current charge covers the round trip with reserve left. |
+| `drain_key(vehicle)` | That vehicle's own cost key, `vehicle.wh_per_meter:rover_1`. |
+| `drain_per_meter(vehicle)` | Learned Wh per metre, or a pessimistic default. Wrong high brings the vehicle home early; wrong low strands it. |
+| `record_drain(vehicle, wh_used, meters)` | Fold one observed trip into that vehicle's running estimate. |
+| `can_reach_and_return(vehicle, x, y, reserve)` | Whether the current charge covers the round trip with reserve left. |
+
+**Keyed per vehicle id, not per kind:** each mounted module adds to the draw while
+moving, so two Pioneers on the same `.kind` carrying different rigs genuinely cost
+different amounts per metre. A vehicle with no history uses the pessimistic default
+and comes home early until it has learned its own figure. Ids also survive the module
+swaps both Pioneers are due when Large Battery Holders unlock.
 
 ### Home and docking
 
@@ -311,15 +383,49 @@ survey, drill or transfer.
 | --- | --- |
 | `find_home(vehicle)` | Resolve home to the nearest charging station's own docking point, across every outpost. Falls back to the outpost anchor, then the origin, and says which it picked. |
 | `docked_status(vehicle)` | The outpost's own verdict, read from fleet telemetry — the exact flag the charging station gates on. |
-| `at_home(vehicle)` | Docked, or within tolerance of the docking point when docking cannot be read. |
-| `undocked_warning(vehicle)` | Parked on the home target but not counted as docked. Says so once per episode. |
+| `at_home(vehicle, tolerance)` | Docked, or within tolerance of the docking point when docking cannot be read. |
+| `undocked_warning(vehicle, warn_after)` | Parked on the home target but not counted as docked. Says so once per episode. |
 
-### Movement
+### Movement, waiting and status
 
 | Function | Purpose |
 | --- | --- |
-| `drive_to(vehicle, x, y, throttle, tolerance)` | Drive there and park. Returns `False` without parking when the battery hits the stranding floor or progress stops, because "head home" and "give up here" are different decisions. |
-| `go_home(vehicle)` | Drive to the docking point and park. `True` only once the outpost counts the rover as docked. |
+| `drive_to(vehicle, x, y, throttle, tolerance, stranded, stall_limit)` | Drive there and park. Returns `False` without parking when the battery hits the stranding floor or progress stops, because "head home" and "give up here" are different decisions. |
+| `go_home(vehicle, throttle, tolerance, idle, warn_after)` | Drive to the docking point and park. `True` only once the outpost counts the vehicle as docked. |
+| `in_bounds(x, y, planet)` | Whether the planet accepts a coordinate. |
+| `wait_for_charge(vehicle, level, warn_after, idle)` / `working()` | Park and wait, saying once when nothing is charging the vehicle. `working()` clears both the wait counter and the charge tracker below. |
+| `report(vehicle, state, target=None, extra=None)` | Broadcast state, battery, position, docked, home and target on `vehicle.status:<id>`. `extra` carries what only one kind of vehicle has — a rover's cargo count, a Pioneer's job id. |
+
+### Departing
+
+| Function | Purpose |
+| --- | --- |
+| `is_charging(vehicle)` | Whether the station is still working on this vehicle. Read through `try`/`except`, so a kind without `status()` reports "not charging" rather than stopping the loop. |
+| `charge_stalled(vehicle, level, passes)` | Whether the level has stopped rising for several consecutive calls. The stored level is a high-water mark, so a dip does not reset it. |
+| `ready_to_depart(vehicle, level, have_target, depart)` | The whole rule, in one place. |
+
+`DEPART_FRACTION` is a floor, not a target: below it a vehicle never leaves. Above it,
+leaving immediately throws away everything the station was still about to put in —
+`fleet.CHARGE_TARGET` is a full battery, so departing at the floor costs half the range
+every trip. Three things end the wait: the station finishing, the level going flat, or
+a reachable job already being in range.
+
+The stall fallback is what covers a station that is shed, unpowered, or capped at
+depart level by conserve mode. None of those announce themselves; from the pad all
+three look like a battery that stopped climbing. It is also why waiting on the
+station's signal is correct in conserve mode, where a fixed higher threshold would wait
+for a charge that is never coming.
+
+`lib/fleet.py` imports `DEPART_FRACTION` from here rather than declaring its own: the
+station tops a waiting rover to exactly the level the rover then refuses to leave
+below, so the two numbers are load-bearing together.
+
+## `lib/rover.py`
+
+Prospecting and mining: sweep, survey, score, claim, drill, unload. One script per
+rover rather than machines coordinating, because nav, sonar and drill are all modules
+on the vehicle. Driving, parking, docking and the learned drive cost are delegated to
+[vehicle](#libvehiclepy).
 
 ### Prospecting memory
 
@@ -332,7 +438,7 @@ the object `survey()` handed back.
 | `record_of(site)` | Snapshot one surveyed mineral site. |
 | `remember(record)` | Persist it, so the other rover and the next restart can use it. |
 | `forget(record)` | Mark it worked out. |
-| `known_sites()` | Every remembered site still worth a visit, read fresh each time. The other rover writes to the same key, so a cached list would miss its finds and re-target its dead sites. |
+| `known_sites()` | Every known mineral site still worth a visit, read fresh each time — the archive and the Journal ([survey](#libsurveypy)) merged, so a deposit surveyed by anything reaches the rovers. Where both describe the same site the archived record wins: it is the only one carrying `exhausted`, and the Journal would offer a worked-out deposit back forever. |
 
 ### Claims
 
@@ -354,28 +460,34 @@ and a rover stopped mid-trip cannot lock a deposit forever.
 | `rover_number(vehicle_id)` | The trailing number in an id. |
 | `rover_count()` | How many rovers the fleet owns, counted rather than assumed. |
 | `ring_offset(vehicle, total_points)` | Where on the ring this rover starts, so rovers spread evenly without being told about each other. |
-| `in_bounds(x, y, planet)` | Whether the planet accepts a coordinate. |
 | `sweep(vehicle)` | Sonar sweep from where the rover is parked. Only `"ok"` documents the payload, so partial statuses return an empty list rather than reading a field that is not promised. |
 | `survey(vehicle, site)` | Survey and return the **fresh** site object. The pre-survey object keeps its hidden values forever. |
 | `is_minable(record, hardness_limit)` | Whether it is ore this drill can still work. |
-| `score(record, vehicle, wanted_by_earth={})` | Wanted beats rich, rich beats close. Earth demand outranks both — ore nobody is waiting for just fills a crate. |
-| `best_site(vehicle, records, hardness_limit)` | Highest-scoring reachable, unclaimed, minable site. |
+| `score(record, vehicle, wanted_by_earth={})` | Wanted beats rich, rich beats close. Earth demand outranks both — ore nobody is waiting for just fills a crate. `wanted_by_earth` is **raw material**, keyed by ore id; handed the finished goods an order literally names, this test can never fire. |
+| `best_site(vehicle, records, hardness_limit)` | Highest-scoring reachable, unclaimed, minable site. Scores against [`recipes.raw_demand()`](#librecipespy), read once per call rather than per candidate. |
 
 ### Mining and unloading
 
 | Function | Purpose |
 | --- | --- |
-| `mine_out(vehicle, record)` | Drill until the hold is full, the site refuses, or reserve is hit. Returns units mined and whether the deposit is gone. |
+| `mine_out(vehicle, record)` | Drill until the hold is full, the site refuses, or reserve is hit. Returns units mined, whether the deposit is gone, and whether **we** were what stopped — no room, no charge. |
 | `work_site(vehicle, record)` | Claim, drive, drill, release. The claim goes up before the drive, so the other rover picks different ground while this one is still on its way. |
 | `unload(vehicle, sinks)` | Empty the hold into the bank, routing each stack separately because a bin holds one material. Needs Auto Feeders. |
-| `wait_for_charge(vehicle, level)` / `working()` | Park and wait, saying once when nothing is charging the rover. |
-| `report(vehicle, state, target=None)` | Broadcast state, battery, cargo, position, docked and current target. |
+| `report(rover, state, target=None)` | Broadcast the vehicle-layer status fields plus the hold count. |
 | `run(vehicle, sink=None, rings=3, start_index=None)` | The whole loop. Leave every argument off and the sink, the ring offset and the site list are all worked out at runtime. |
 
 **On exhaustion:** `drill.mine()` has no site-empty outcome. A worked-out deposit
 simply stops being a site, and the next call reports `not_at_site`. That means
 exhausted only once this visit has pulled a unit out of the ground — the identical
 status with nothing mined means the rover parked short.
+
+**A full hold is not a worked-out deposit.** Sites picked this session are marked so
+the rover moves on rather than re-picking its best remembered one every pass, but that
+mark means "do not retry right now", not "never again". A visit that brought ore back
+and ended because the hold filled or the charge ran down clears it — the ore is still
+in the ground and the rover is about to be empty again. A visit that produced nothing
+keeps it, exactly like a failed drive. Only exhaustion is permanent, and that is
+archive-backed.
 
 ## `lib/smelting.py`
 
@@ -386,10 +498,18 @@ production.
 | Function | Purpose |
 | --- | --- |
 | `resolve_recipe(smelter, recipe_id)` | The recipe, or `None` with an explanation. `find_recipe()` returns `None` for unknown, locked and wrong-machine ids alike, so the message covers all three. |
+| `follow_demand(smelter, recipe)` | The recipe to run this pass: what [live demand](#librecipespy) wants, when it is safe to switch, else the one already latched. |
 | `latch_recipe(smelter, recipe)` | Select it, unless it is already active or a unit is mid-craft. |
 | `drain(smelter, recipe, sink_bins)` | Push finished units to whichever bin is already latched to that metal, falling back to an empty one. |
 | `feed(smelter, recipe, source_bins)` | Top up the input buffer from the ore bank. |
 | `run(smelter, recipe_id, source_bins, sink_bins, interval=2)` | Run one smelter forever. Stops feeding while the base conserves: a smelter's draw is variable and spent only while processing, so the throttle is simply not giving it more ore. |
+
+**`recipe_id` is a fallback, not a pin.** The active Earth Order picks the recipe, so
+the machine script does not have to be hand-edited every time the board turns over. A
+switch only happens with the machine stopped and both buffers empty — that is what
+keeps `set_recipe()` away from `busy` and `material_mismatch` — and demand that names
+nothing this machine can make leaves the current recipe alone rather than clearing it,
+because a smelter with no recipe set can never be judged idle again.
 
 ## `lib/dock.py`
 
@@ -403,8 +523,169 @@ work is the four transitions: pick, load, enable, and react when the order clear
 | Function | Purpose |
 | --- | --- |
 | `score_order(order)` | Rank open orders. Part-shipped orders win, because abandoning progress wastes it. A recipe or tech reward outranks a credit payout. |
-| `pick_order(crates, prefer_weekly=False)` | The best order we can actually make progress on. An order we cannot feed is a dock sitting idle with an assignment. |
+| `matches(order, prefer)` | Whether one string names this order — its id, name, contractor id or name, or reward label, matched case-insensitively as a substring. |
+| `preferred(prefer, prefer_weekly=False)` | The open order the operator asked for. Feedability is deliberately not checked: assigning an order we cannot fill *is* how the rest of the base is told to go fill it. |
+| `pick_order(crates, prefer_weekly=False, prefer=None)` | The best order we can actually make progress on. A stated preference wins outright; otherwise an order we cannot feed is a dock sitting idle with an assignment. |
 | `assign(dock_machine, order)` | Latch an order onto the dock, naming the reason when it refuses — loaded cargo from a previous order is physical and blocks reassignment. |
+| `drain(dock_machine, crates)` | Eject every loaded slot back into local storage. `eject()`, never `flush()`: flushing destroys material the base spent ore and power making. |
+| `switch(dock_machine, order, crates)` | Move an already-assigned dock onto another order. Campaign only — `.shipped` is shared and permanent, so the order left behind keeps every unit sent to it, while a weekly would lose everything at the next refresh. |
 | `load(dock_machine, order, crates)` | Pull what the order still needs out of the crate bank. |
 | `enable(dock_machine)` | Start the dispatcher if it is not already running. |
-| `run(dock_machine, crates, prefer_weekly=False, interval=10)` | Serve Earth Orders forever, publishing demand every pass. |
+| `run(dock_machine, crates, prefer_weekly=False, prefer=None, interval=10)` | Serve Earth Orders forever, publishing demand every pass. |
+
+**The three contractors expose their current orders simultaneously.** Helios Orbital,
+Spire Research and Vestibule Logistics each show the first unfinished order in their
+own authored queue, so a named one is available now — there is never anything to wait
+out. `prefer` is what turns that into control.
+
+**The startup line's `units/h` is an overcrowding gauge.** `dispatch_rate()` already
+includes the outpost's overcrowding penalty, and the base rate is 25 with no throughput
+research. Below 25 means the outpost is over its soft building threshold.
+
+## `lib/survey.py`
+
+Map knowledge: what the Journal and the planet already know. No vehicle in this file —
+everything here reads components that answer whether or not anything is driving.
+
+That is the point. The Journal is written by every sonar sweep any vehicle has ever
+done and survives restarts, vehicle changes and save/load, so a Pioneer with no sonar
+can still read ground the rovers covered. Our own `rover.sites` archive only ever held
+what our two rovers surveyed while the script happened to be running.
+
+Sites are flattened into the same JSON-safe dict shape `lib/rover.py` writes to its
+archive — `id`, `name`, `x`, `y`, `kind`, plus `item_id` / `hardness` / `purity` for
+minerals. One shape means the rover's scoring path takes a Journal record and one of
+its own remembered records without knowing the difference.
+
+| Function | Purpose |
+| --- | --- |
+| `journal()` | The Journal component, or `None` before that research. |
+| `planet()` | The planet component, or `None` when it cannot be read. |
+| `distance(ax, ay, bx, by)` | Straight-line meters between two world coordinates. |
+| `record_of(site)` | One site of any kind as a flat, JSON-safe record. Minerals always carry the three mineral keys, `None` included: "found but not yet resolved" is a normal state. |
+| `sites(kind=None)` | Every site sonar has ever classified, flattened. `[]` before the Journal research is a real answer. |
+| `surveyed(kind=None)` | As `sites()`, but only the fully-resolved ones — the records with real item, hardness and purity on them. |
+| `points()` | Every permanent "?" contact on the map, as flat records. Costs nothing and needs no sweep. |
+| `unscanned_points()` | The contacts nobody has scanned yet — the scout's target list. |
+| `bounds()` / `contains(x, y)` / `biome_at(x, y)` | Thin, `None`-safe wrappers on the planet. `contains()` answers `True` with no planet component: refusing to drive because the map cannot be read is worse than letting nav reject the target. |
+| `cluster(records, radius=120)` | Group records within `radius` of each other and return each group's centroid, member count and kind mix. This is what turns "sites" into "places worth an outpost". |
+
+## `lib/scout.py`
+
+The Pioneer's scouting loop: rank where an outpost should go, and prove it is legal.
+Built on [vehicle](#libvehiclepy) and [survey](#libsurveypy). **It builds nothing** —
+there is exactly one Outpost Kit, so the choice is a conversation, not a script
+decision.
+
+Two rules shape it. The desk survey comes first: at 50 m a sweep covers almost no
+ground, while `points_of_interest()` hands over real coordinates for free, so the first
+shortlist is published before the Pioneer moves. And a candidate is reported only after
+`plan_structure` has accepted the footprint — the clearance radius around an outpost is
+not documented anywhere, so any radius modelled here would be a guess that rots.
+
+### The rig
+
+| Function | Purpose |
+| --- | --- |
+| `slots(pioneer)` | Every chassis slot, or `[]` when the rig cannot be inspected. |
+| `mounted(pioneer, capability)` | `True` when a module naming that capability is mounted. Asked of the chassis, not assumed from a loadout note: both Pioneers share a `.kind` and either can be re-rigged. |
+| `sonar_label(pioneer)` | Sonar range and tier as one string, or `"none"`. |
+| `cargo_bins(pioneer)` | Portable bins installed across every Cargo Rack. |
+
+### Unresolved contacts
+
+`too_hard`, `tier_too_low` and `research_required` are not failures. Each means "the
+sweep finished and there is an unresolved contact here", at a known position — the one
+kind of map knowledge a hardness-1 sonar can still produce about a deposit it cannot
+classify. Kept under the Data Archive key `scout.unresolved`, they make a later Wide or
+Deep Sonar trip targeted instead of a re-sweep from scratch, and they count toward a
+candidate's score today.
+
+| Function | Purpose |
+| --- | --- |
+| `point_id(x, y)` | A stable id for a bare coordinate, `at:120:-40`. |
+| `remember_unresolved(x, y, status)` | Write down a contact the sonar finished on but could not classify. |
+| `unresolved()` | Every unresolved contact recorded so far. |
+| `contacts()` | Every map contact worth clustering, from all three sources — Journal sites, map "?" points, our own unresolved sweeps — with the same place never counted twice. |
+
+### Ranking and validation
+
+| Function | Purpose |
+| --- | --- |
+| `home_distance(x, y)` | Meters from the docking point this Pioneer calls home. |
+| `nearest_outpost(x, y)` | `(id, meters)` of the closest outpost owned. Reported, not scored against: whether a spot is too close is `plan_structure`'s answer to give. |
+| `score_candidate(group)` | What is there, less how far away it is. A vent or well outweighs everything else because it is the only thing that cannot be driven to and carried home. Distance is subtracted in meters, not multiplied, so it decides between equals without swamping a better candidate. |
+| `purpose(group, distance_home)` | A label from the mix — `utility`, `harvesting`, `production`, `power`. Biome is reported alongside but not scored: nothing in the manual makes output depend on it, so a weight would be invented. |
+| `candidate_of(group)` | One cluster as the flat record that gets reported, members summarised so the payload publishes and archives whole. |
+| `validate(candidate)` | Ask the game whether an outpost may stand here, record the verdict either way, and retract the ghost the moment it comes back `ok`. |
+| `verdicts()` | The last round of placement verdicts as one phrase, so an empty shortlist says whether the map is taken or the research is missing. |
+| `shortlist(radius, probe=12, limit=5)` | The ranked, validated list. No vehicle, no driving — callable before the Pioneer has moved and again after every sweep. |
+
+### Reporting and the loop
+
+| Function | Purpose |
+| --- | --- |
+| `report(candidates)` | Publish the shortlist on screen, on the `scout.candidates` bus channel, in the archive and on the map — but only when it has changed. |
+| `status(pioneer, state, target=None, extra=None)` | This Pioneer's live status, delegated to `vehicle.report`. |
+| `idle(pioneer, radius, passes=30)` | Wait, re-ranking now and then. Idling is free; a rebuild probes placement for real. |
+| `sweep(pioneer)` | Sonar sweep from where the Pioneer is parked. Returns `(status, sites)` — unlike the rover's, this one hands the status back. |
+| `resolve(pioneer, contact)` | Survey one contact of any kind. Vents and wells are exactly what make a candidate `utility` ground, and the rovers survey neither. |
+| `sweep_at(pioneer, x, y)` | Drive, park, sweep, survey. `True` when a sweep happened, which is the cue that the shortlist may have moved. |
+| `next_target(pioneer)` | The nearest unscanned "?" this charge can reach and return from. |
+| `next_filler(pioneer, waypoints, start)` | The next ring waypoint worth driving to, and where to resume. `None` after a full turn finds nothing left — spinning the list again would cost a pass for nothing. |
+| `run(pioneer, radius=120, rings=3)` | Survey, rank, validate, report. Forever, and without building. |
+
+## `lib/pioneer.py`
+
+The Pioneer's construction loop: drain the shared blueprint queue, forever. Built on
+[vehicle](#libvehiclepy).
+
+It has no idea what an outpost is. Every job carries its own `.required_item` and
+`.required_count`, and the manual is explicit that those fields — never `.kind` — say
+what to load. That one rule is the whole of the generic worker: the same loop that
+founds an outpost builds pipes, power lines, bridges, drills and deconstruction jobs
+with no new code. Founding is one job in the queue, not a mode.
+
+Interruptions are normal. Stop, power loss, leaving the site, a rescue or unmounting
+the Constructor Module pauses paid work without losing progress or materials, so
+`paused_constructions()` is the first list read every pass, most-completed first —
+that is where material already spent is sitting.
+
+### What a job asks for
+
+| Function | Purpose |
+| --- | --- |
+| `queue()` | The Construction Blueprint component, or `None` before that research. |
+| `constructor(pioneer)` | The mounted Constructor Module, or `None` when the rig has no builder. |
+| `needs(job)` | `(item_id, count)` this job wants in cargo, or `(None, 0)`. `None` is a real answer: deconstruction returns parts, and a paused job has its material already sunk into the site. |
+| `carried(pioneer, item_id)` | Units of that item aboard, summed across every bin. |
+| `have(pioneer, item_id, count)` | `True` when the hold already covers the requirement. |
+| `room_for(pioneer, item_id)` | Units the installed bins can still take. Not `cargo.full()` — a bin latches to one item id, so a half-empty bin of iron ore is real space that an Outpost Kit cannot use. |
+
+### Loading
+
+| Function | Purpose |
+| --- | --- |
+| `dock_station()` | The `BuildingRef` of the charging station `HOME` resolved to. |
+| `source_store()` | What to load from while parked at home. `caps.local_store()` needs something that knows its own outpost and a vehicle is exactly what does not, so the station it is docked at is asked instead — Inventory at Nocturna Base, a Warehouse or Storage Bin elsewhere. |
+| `load(pioneer, item_id, count)` | Put the material aboard. Only at home, only with Auto Feeders. A shortfall is named at the pad rather than discovered in the field as `insufficient_materials` after a drive out. |
+
+### The queue and the build
+
+| Function | Purpose |
+| --- | --- |
+| `jobs()` | Every queued job worth trying, in the order to try them: paused and most-completed first, then work this Pioneer started and can rejoin, then everything still waiting. |
+| `next_job(pioneer)` | The first job this charge can reach and come home from. Doubles as the departure gate's target. |
+| `label(job)` / `marks(job)` | A job as one readable phrase, and the id/kind fields that ride along on the status channel. |
+| `status(pioneer, state, target=None, extra=None)` | This Pioneer's live status, delegated to `vehicle.report`. States are `idle`, `loading`, `driving`, `constructing`, `returning`, `waiting_for_charge`, `blocked`, `stranded`. |
+| `do_job(pioneer, job)` | Load, drive, park, build. `True` only when the job actually finished. `wrong_position` re-approaches harder — arrival tolerance means close enough, not stopped; `insufficient_materials` goes home and reloads once; transient statuses come back next pass. |
+
+### Founding and capacity
+
+| Function | Purpose |
+| --- | --- |
+| `outpost_at(x, y, tolerance=30)` | An owned outpost already standing there, or `None`. |
+| `outpost_ghosts()` | Every queued outpost blueprint, at any stage of being built. |
+| `found_outpost(x, y)` | Queue the outpost ghost and return its blueprint id. Planning needs no vehicle at the site. Refuses while an unbuilt outpost is queued and says nothing once one stands there, so a restart cannot spend a second kit. |
+| `capacity_line()` / `watch_capacity()` | Each outpost's `buildings_used` against its soft threshold, said at startup and whenever it changes. The threshold throttles output rather than blocking deployment, which is why it is worth naming. |
+| `run(pioneer, interval=10)` | Build whatever is queued, forever. A Pioneer with no Constructor Module says so and stops rather than idling on a queue it can never work. |

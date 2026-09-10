@@ -15,6 +15,7 @@ than failing on the first transfer.
 import bus
 import caps
 import ports
+import recipes
 import storage
 
 # Units to pull per top-up. Small enough that a bin switch mid-run does
@@ -68,6 +69,36 @@ def latch_recipe(smelter, recipe) -> bool:
         return False
     notify(f"set_recipe {recipe.id}: {result.message}", "warn")
     return False
+
+
+def follow_demand(smelter, recipe):
+    """The recipe to run this pass: what Earth is waiting for, when it is
+    safe to switch, else the one already latched.
+
+    The `recipe_id` handed to run() is a FALLBACK, not a pin (D-028):
+    hand-editing the machine script every time the order board turns over
+    is exactly the hardcoding this codebase exists to avoid.
+
+    Two guards. A switch only happens with the machine stopped and both
+    buffers empty, which is what keeps set_recipe() away from `busy` and
+    `material_mismatch`. And demand that names nothing this machine can
+    make leaves the current recipe alone rather than clearing it - an
+    idle latched smelter is harmless, while a smelter with no recipe set
+    can never be judged idle again, so its breaker could never come back
+    (D-007).
+    """
+    wanted = recipes.live_demand()
+    pick = recipes.best_recipe(smelter, wanted)
+    if pick is None or pick.id == recipe.id:
+        return recipe
+    if smelter.is_running():
+        return recipe
+    if smelter.get_input_count() > 0 or smelter.get_output_count() > 0:
+        return recipe
+
+    notify(f"Smelter switching to {pick.name}: Earth still wants"
+           f" {wanted.get(pick.output_item, 0)} x {pick.output_item}")
+    return pick
 
 
 def drain(smelter, recipe, sink_bins) -> int:
@@ -135,7 +166,9 @@ def run(smelter, recipe_id, source_bins, sink_bins, interval=2):
     """Run one smelter forever.
 
     smelter      the Smelter this script runs inside - pass `self`
-    recipe_id    e.g. "smelt_iron_ingot"
+    recipe_id    what to run when live demand asks for nothing this
+                 machine makes, e.g. "smelt_iron_ingot". A fallback, not
+                 a pin: the active Earth Order picks the recipe (D-028).
     source_bins  bin ids that may hold the input ore
     sink_bins    bin ids that may receive the finished metal
     interval     seconds between passes
@@ -155,6 +188,8 @@ def run(smelter, recipe_id, source_bins, sink_bins, interval=2):
     ])
 
     while True:
+        recipe = follow_demand(smelter, recipe)
+
         if not latch_recipe(smelter, recipe):
             sleep(interval)
             continue

@@ -17,48 +17,24 @@ Two rovers running this same file stay out of each other's way without a
 manager: they start at different points on the waypoint ring, they claim a
 site on the bus before driving to it, and what they survey goes into the
 Data Archive so either of them can work it after a restart.
+
+Driving, parking, docking and the learned Wh-per-meter figure are not rover
+work and live in `lib/vehicle.py`, which the Pioneer shares. What is left
+here is prospecting: sweep, survey, score, claim, drill, unload.
 """
 
 import bus
 import caps
-import earth
+import recipes
 import storage
+import vehicle
+# Named import, not `import survey`: this file already has its own
+# survey() and the module would be shadowed by it everywhere below.
+from survey import surveyed
+from vehicle import HOME, RESERVE_FRACTION, STRANDED_FRACTION,DEPART_FRACTION, IDLE_INTERVAL, at_home,can_reach_and_return, drive_to, find_home, go_home,in_bounds, ready_to_depart, record_drain,wait_for_charge, working
 
 PLANET_ID = "nocturna"
-STATION_TYPE = "charging_station"
 FLEET_ID = "fleet"
-
-# Where "home" is. (0, 0) is only the coordinate origin; the point that
-# matters is the charging station's docking position, resolved by
-# find_home() when the script starts. Docked means parked inside the
-# outpost footprint plus a ~2 m margin, and a rover parked 3 m short of
-# that footprint waits for a charge that never comes.
-HOME = {"x": 0, "y": 0, "id": "origin"}
-
-# Arrival tolerance. The docs say a loop needs > 2 rather than exact zero.
-ARRIVE_TOLERANCE = 3.0
-
-# Home leg tolerance. Must land inside the ~2 m service margin, so it is
-# tighter than the field tolerance.
-HOME_TOLERANCE = 1.5
-
-# One throttle for every leg, and a low one. The docs are blunt about this:
-# a full Rover at full throttle lasts about 5 hours, at half throttle closer
-# to 20. Racing home is what strands a rover, not dawdling. Using a single
-# value also keeps the learned Wh/metre figure meaningful - a blend of two
-# throttles would describe neither.
-CRUISE_THROTTLE = 0.5
-RETURN_THROTTLE = 0.5
-
-# Battery fractions. Below 0.1 the docs call the rover close to stranded.
-RESERVE_FRACTION = 0.30        # stop mining, head home
-STRANDED_FRACTION = 0.12       # stop everything, call for help
-DEPART_FRACTION = 0.45         # do not start a new trip below this
-
-# Learned energy cost, persisted once Data Archive exists.
-DRAIN_KEY = "rover.wh_per_meter"
-DEFAULT_DRAIN = 0.05           # Wh per meter, deliberately pessimistic
-DRAIN_SMOOTHING = 0.3          # weight of each new sample
 
 # Surveyed sites, kept across restarts: {site_id: record}.
 SITES_KEY = "rover.sites"
@@ -68,213 +44,18 @@ SITES_KEY = "rover.sites"
 # enough that a rover stopped mid-trip frees the site on its own.
 CLAIM_TTL = 600
 
-# A drive that makes no progress for this many checks is treated as blocked.
-STALL_LIMIT = 20
-
-# Seconds to wait between passes when there is nothing to do.
-IDLE_INTERVAL = 10
-
-# Passes to wait at base before pointing out that nothing is charging us.
-CHARGE_WARN_AFTER = 30
-
 # scan() statuses that mean "the sweep finished but something out there is
 # beyond this sonar". The sweep is not a failure and .sites is not readable.
 SWEEP_PARTIAL = ["too_hard", "tier_too_low", "research_required",
                  "wrong_scanner"]
 
 
-# --- learned drive cost -------------------------------------------------
+# --- prospecting memory -------------------------------------------------
 
 def _notebook():
     """The Data Archive component, or None before that research."""
     return get_component("notebook")
 
-
-def drain_per_meter():
-    """Learned Wh cost per meter driven, or a pessimistic default.
-
-    Being wrong high is cheap: the rover comes home early. Being wrong low
-    strands it in the field, so the default errs high until real samples
-    replace it.
-    """
-    book = _notebook()
-    if book is None:
-        return bus.read(DRAIN_KEY, DEFAULT_DRAIN)
-    return book.get(DRAIN_KEY, DEFAULT_DRAIN)
-
-
-def record_drain(wh_used, meters):
-    """Fold one observed trip into the running estimate."""
-    if meters <= 0 or wh_used <= 0:
-        return
-    sample = wh_used / meters
-    blended = (drain_per_meter() * (1 - DRAIN_SMOOTHING)
-               + sample * DRAIN_SMOOTHING)
-    book = _notebook()
-    if book is not None:
-        book.set(DRAIN_KEY, blended)
-    bus.publish(DRAIN_KEY, blended)
-
-
-def can_reach_and_return(vehicle, x, y):
-    """True when the current charge covers the round trip with reserve left."""
-    distance = vehicle.nav.get_distance_to(x, y)
-    home_leg = _distance_between(x, y, HOME["x"], HOME["y"])
-    needed = (distance + home_leg) * drain_per_meter()
-    usable = vehicle.battery.wh() - (vehicle.battery.capacity()
-                                     * RESERVE_FRACTION)
-    return usable > needed
-
-
-def _distance_between(ax, ay, bx, by):
-    return sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
-
-
-# --- home and docking ---------------------------------------------------
-
-def find_home(vehicle):
-    """Resolve HOME to the nearest charging station's docking point.
-
-    The docs say to target a building's own position for at-building
-    work rather than the outpost footprint anchor, and charging is
-    at-building work. Every outpost is searched and the station nearest
-    the rover's current position wins, so a rover working out of a
-    founded outpost docks there. Falls back to the home outpost anchor,
-    then to the origin, and says which one it picked.
-    """
-    position = vehicle.nav.get_position()
-    nearest = None
-    nearest_distance = 0
-    for ref in caps.buildings(STATION_TYPE):
-        distance = _distance_between(position.x, position.y,
-                                     ref.position[0], ref.position[1])
-        if nearest is None or distance < nearest_distance:
-            nearest = ref
-            nearest_distance = distance
-
-    if nearest is not None:
-        HOME["x"] = nearest.position[0]
-        HOME["y"] = nearest.position[1]
-        HOME["id"] = nearest.id
-        return
-
-    network = caps.component("outpost_network")
-    if network is not None:
-        outpost = network.home()
-        coords = outpost.coords()
-        HOME["x"] = coords[0]
-        HOME["y"] = coords[1]
-        HOME["id"] = outpost.id
-        notify("No Vehicle Charging Station found - homing on the outpost"
-               " anchor instead", "warn")
-        return
-
-    notify("No outpost network readable - homing on (0, 0)", "warn")
-
-
-def docked_status(vehicle):
-    """The outpost's own verdict on whether this rover is docked.
-
-    This is the exact flag the charging station's manager gates on, read
-    from fleet telemetry. None when it cannot be read, in which case the
-    caller falls back to distance.
-    """
-    component = get_component(FLEET_ID)
-    if component is None:
-        return None
-    for ref in component.vehicles():
-        if ref.id == vehicle.id:
-            return ref.is_docked
-    return None
-
-
-def at_home(vehicle):
-    """True when this rover counts as docked, or is within HOME_TOLERANCE
-    of the docking point if docking cannot be read."""
-    docked = docked_status(vehicle)
-    if docked is not None:
-        return docked
-    return vehicle.nav.get_distance_to(HOME["x"], HOME["y"]) <= HOME_TOLERANCE
-
-
-undocked = {"passes": 0}
-
-
-def undocked_warning(vehicle):
-    """Parked on the home target but the outpost says not docked. The home
-    coordinate is wrong, or the station sits outside the footprint - say
-    so once, not every pass."""
-    undocked["passes"] = undocked["passes"] + 1
-    if undocked["passes"] % CHARGE_WARN_AFTER != 1:
-        return
-    position = vehicle.nav.get_position()
-    notify(f"Rover parked at ({round(position.x, 1)}, {round(position.y, 1)})"
-           f" targeting {HOME['id']} at ({round(HOME['x'], 1)},"
-           f" {round(HOME['y'], 1)}) but the outpost does not count it as"
-           f" docked - it will not be charged here", "warn")
-
-
-# --- movement -----------------------------------------------------------
-
-def drive_to(vehicle, x, y, throttle=CRUISE_THROTTLE,
-             tolerance=ARRIVE_TOLERANCE):
-    """Drive to (x, y) and PARK there. True on arrival.
-
-    Returns False without parking when the battery falls to the stranding
-    floor or the rover stops making progress - the caller decides what to
-    do about it, because "head home" and "give up here" are different.
-    """
-    targeted = vehicle.nav.set_target(x, y)
-    if targeted.status != "ok":
-        notify(f"nav.set_target({x}, {y}): {targeted.message}", "warn")
-        return False
-
-    vehicle.nav.set_throttle(throttle)
-    stalled = 0
-
-    while vehicle.nav.get_distance_to(x, y) > tolerance:
-        if vehicle.battery.level() < STRANDED_FRACTION:
-            vehicle.nav.brake()
-            return False
-        if vehicle.nav.get_speed() <= 0:
-            stalled = stalled + 1
-            if stalled >= STALL_LIMIT:
-                vehicle.nav.brake()
-                notify(f"Rover made no progress toward ({x}, {y}) - blocked?",
-                       "warn")
-                return False
-        else:
-            stalled = 0
-        sleep(1)
-
-    vehicle.nav.brake()            # near is not stopped; work needs parked
-    return True
-
-
-def go_home(vehicle):
-    """Drive to the docking point and park. True once the outpost counts
-    the rover as docked, or on arrival when docking cannot be read.
-
-    Arriving within tolerance is not the same as being docked, and only
-    docked vehicles get charged. So arrival is checked against the
-    outpost's flag, and a parked-but-undocked rover is reported rather
-    than left looking idle.
-    """
-    if not drive_to(vehicle, HOME["x"], HOME["y"], RETURN_THROTTLE,
-                    HOME_TOLERANCE):
-        return False
-
-    sleep(1)                       # telemetry is a snapshot; let it see us parked
-    if docked_status(vehicle) is False:
-        undocked_warning(vehicle)
-        sleep(IDLE_INTERVAL)
-        return False
-
-    undocked["passes"] = 0
-    return True
-
-
-# --- prospecting memory -------------------------------------------------
 
 # What the next archive transaction should write. The updater handed to
 # notebook.transaction() must be a small pure function of the stored
@@ -361,25 +142,43 @@ def forget(record):
 
 
 def known_sites():
-    """Every remembered site still worth a visit, read fresh.
+    """Every known mineral site still worth a visit, read fresh.
+
+    Two sources, one list, same record shape. The Journal is planet-wide
+    and restart-safe, so a deposit surveyed by anything - the other
+    rover, a scouting Pioneer, a sweep from three sessions ago - reaches
+    this rover through it (D-010). The archive holds the one thing the
+    Journal cannot, our own `exhausted` flag, so where both describe the
+    same site the archived record wins: a worked-out deposit is still
+    surveyed, and the Journal would happily offer it back forever.
 
     Re-read rather than cached: the other rover is writing to the same
     key, so a cached list would miss its finds and keep sending this
     rover to deposits it has already worked out.
     """
+    stored = {}
     book = _notebook()
-    if book is None:
-        return []
-    stored = book.get(SITES_KEY, {})
-    if not isinstance(stored, dict):
-        return []
+    if book is not None:
+        archived = book.get(SITES_KEY, {})
+        if isinstance(archived, dict):
+            stored = archived
 
     records = []
+    archived_ids = {}
     for site_id in stored:
         record = stored[site_id]
         if not isinstance(record, dict):
             continue
+        archived_ids[site_id] = True
         if record.get("exhausted", False):
+            continue
+        if visited.get(site_id, False):
+            continue
+        records.append(record)
+
+    for record in surveyed("mineral"):
+        site_id = record["id"]
+        if archived_ids.get(site_id, False):
             continue
         if visited.get(site_id, False):
             continue
@@ -476,13 +275,6 @@ def ring_offset(vehicle, total_points):
     return (place * total_points // rover_count()) % total_points
 
 
-def in_bounds(x, y, planet):
-    """True when the planet accepts this coordinate."""
-    if planet is None:
-        return True
-    return planet.contains(x, y)
-
-
 def sweep(vehicle):
     """Sonar sweep from where the rover is parked. Returns a list of sites.
 
@@ -557,6 +349,10 @@ def score(record, vehicle, wanted_by_earth={}):
     Purity is a straight yield multiplier, so it outweighs a longer drive
     up to a point; distance breaks ties between equal grades. Earth demand
     outranks both - ore nobody is waiting for just fills a crate.
+
+    `wanted_by_earth` is RAW material, keyed by ore id - what the orders
+    resolve to once the recipe graph has walked them back (D-025). Handed
+    the finished goods an order literally names, this test can never fire.
     """
     grade = 1
     if record["purity"] == "rich":
@@ -579,7 +375,7 @@ def best_site(vehicle, records, hardness_limit):
     the ground it has not swept is worth more than a shared deposit.
     """
     # Read the demand once rather than per candidate site.
-    wanted_by_earth = earth.demand()
+    wanted_by_earth = recipes.raw_demand()
 
     best = None
     best_score = 0
@@ -603,7 +399,12 @@ def mine_out(vehicle, record):
     """Drill until the hold is full, the site refuses, or reserve is hit.
 
     The rover must already be parked at the site. Returns
-    {"mined": units, "gone": True when the deposit is no longer there}.
+    {"mined": units, "gone": True when the deposit is no longer there,
+    "full": True when WE stopped rather than the deposit}.
+
+    `full` is what tells a rich deposit apart from a dead one. Running out
+    of hold or of charge says nothing about the ore still in the ground,
+    and the site has to stay on the list to be worked again (D-026).
 
     mine() has no site-empty outcome: a worked-out deposit simply stops
     being a site, and the next call reports "not_at_site". That means
@@ -616,9 +417,11 @@ def mine_out(vehicle, record):
     """
     mined = 0
     gone = False
+    full = False
 
     while not vehicle.cargo.full():
         if vehicle.battery.level() < RESERVE_FRACTION:
+            full = True
             break
 
         claim(vehicle, record["id"])
@@ -629,6 +432,7 @@ def mine_out(vehicle, record):
         elif result.status in ["busy", "no_power"]:
             sleep(1)                       # transient, per the outcome table
         elif result.status == "no_cargo_space":
+            full = True
             break
         elif result.status == "not_at_site" and mined > 0:
             gone = True
@@ -641,7 +445,9 @@ def mine_out(vehicle, record):
             notify(f"drill.mine: {result.message}", "warn")
             break
 
-    return {"mined": mined, "gone": gone}
+    if vehicle.cargo.full():
+        full = True
+    return {"mined": mined, "gone": gone, "full": full}
 
 
 def work_site(vehicle, record):
@@ -655,6 +461,16 @@ def work_site(vehicle, record):
     when the drive fails. A blocked route does not become unblocked by
     trying it again immediately, and this rover would otherwise pick the
     same unreachable deposit every pass instead of prospecting.
+
+    That mark means "do not retry right now", not "never again" (D-026).
+    A visit that brought ore back and ended because the hold filled or
+    the charge ran down clears it: the ore is still in the ground and the
+    rover is about to be empty again. A visit that produced nothing keeps
+    it, exactly like a failed drive - including the rover that reached a
+    good deposit on its last few percent, which would otherwise re-pick
+    that same site every time it charged and never drill a single unit.
+    Only exhaustion is permanent, and that goes through forget(), which
+    the archive remembers.
     """
     site_id = record["id"]
     visited[site_id] = True
@@ -671,6 +487,8 @@ def work_site(vehicle, record):
     if outcome["gone"]:
         forget(record)
         notify(f"{record['name']} is worked out")
+    elif outcome["full"] and outcome["mined"] > 0:
+        visited.pop(site_id, None)
     release(site_id)
 
     if outcome["mined"] > 0:
@@ -726,53 +544,20 @@ def unload(vehicle, sinks):
     return vehicle.cargo.count() <= 0
 
 
-# --- waiting ------------------------------------------------------------
-
-waiting = {"passes": 0}
-
-
-def wait_for_charge(vehicle, level):
-    """Park at base and wait for the battery to come up.
-
-    A parked vehicle costs nothing, so waiting is free. But nothing
-    charges a rover on its own: it needs a Vehicle Charging Station to be
-    parked at, or a rescue drone. If neither exists this wait never ends,
-    so say so rather than looking idle forever.
-    """
-    waiting["passes"] = waiting["passes"] + 1
-    if waiting["passes"] == CHARGE_WARN_AFTER:
-        notify(f"Rover docked at {HOME['id']} at {round(level * 100)}% and"
-               f" not charging - is the station powered, its script running,"
-               f" and power.mode not stuck on conserve?", "warn")
-    sleep(IDLE_INTERVAL)
-
-
-def working():
-    waiting["passes"] = 0
-
-
 # --- status reporting ---------------------------------------------------
 
-def report(vehicle, state, target=None):
+def report(rover, state, target=None):
     """Broadcast this rover's live status for a fleet manager to read.
 
-    A charging station script cannot see a rover's battery any other way,
-    and the docs suggest exactly this: a manager that dispatches rescues
-    before vehicles are dead. `target` names the site being driven to or
-    drilled, so two rovers working apart is visible from the bus alone.
-    Values are kept JSON-safe.
+    The shared fields are the vehicle layer's; the hold is the one thing
+    only a rover has, so it rides along as `extra`. `target` names the
+    site being driven to or drilled, so two rovers working apart is
+    visible from the bus alone. Values are kept JSON-safe.
+
+    Taking the rover as `rover` rather than `vehicle` is what lets this
+    one function still reach the `vehicle` module it delegates to.
     """
-    position = vehicle.nav.get_position()
-    bus.publish(bus.rover_channel(vehicle.id), {
-        "state": state,
-        "battery": vehicle.battery.level(),
-        "cargo": vehicle.cargo.count(),
-        "x": position.x,
-        "y": position.y,
-        "docked": docked_status(vehicle),
-        "home": HOME["id"],
-        "target": target,
-    })
+    vehicle.report(rover, state, target, {"cargo": rover.cargo.count()})
 
 
 # --- main loop ----------------------------------------------------------
@@ -820,6 +605,7 @@ def run(vehicle, sink=None, rings=3, start_index=None):
                  f" {round(HOME['y'], 1)})"),
         ("remembered sites", len(known_sites())),
         ("first waypoint", f"{start_index} of {len(waypoints)}"),
+        ("wanted ore", list(recipes.raw_demand())),
     ])
 
     index = start_index
@@ -862,26 +648,40 @@ def run(vehicle, sink=None, rings=3, start_index=None):
             wait_for_charge(vehicle, level)
             continue
 
+        # --- is there a job worth leaving for? -----------------------------
+        # Prospecting is what this rover does when it has nothing better
+        # to mine. After a restart the archive usually holds a surveyed
+        # deposit, and driving to that is worth more than re-sweeping
+        # ground the fleet has already covered.
+        #
+        # Picked BEFORE the depart gate, because "a site came back" is the
+        # gate's have_target: best_site() has already filtered through
+        # can_reach_and_return, so a site in hand means the round trip
+        # fits on the charge we are sitting on. The site is then worked
+        # rather than re-picked, so this costs no extra archive reads.
+        remembered = best_site(vehicle, known_sites(), hardness_limit)
+
         # --- not enough to start a new trip --------------------------------
-        if level < DEPART_FRACTION:
-            if not home:
+        # Two different questions, and only one of them is about the
+        # station. In the field the floor is the whole rule, as it always
+        # was: a rover already out there with charge to spare carries on
+        # working rather than driving home to be topped up. On the pad the
+        # station's own signal decides, because that is the only place the
+        # signal means anything (D-027).
+        if not home:
+            if level < DEPART_FRACTION:
                 # Waiting to charge only makes sense at the base. Sitting
                 # in the field waiting for a charge that cannot arrive is
                 # how a rover quietly stops working forever.
                 report(vehicle, "returning")
                 go_home(vehicle)
                 continue
+        elif not ready_to_depart(vehicle, level, remembered is not None):
             report(vehicle, "waiting_for_charge")
             wait_for_charge(vehicle, level)
             continue
 
-        # --- a site we already know beats sweeping for a new one -----------
-        # Prospecting is what this rover does when it has nothing better
-        # to mine. After a restart the archive usually holds a surveyed
-        # deposit, and driving to that is worth more than re-sweeping
-        # ground the fleet has already covered.
         working()
-        remembered = best_site(vehicle, known_sites(), hardness_limit)
         if remembered is not None:
             work_site(vehicle, remembered)
             continue
@@ -900,7 +700,7 @@ def run(vehicle, sink=None, rings=3, start_index=None):
         if not drive_to(vehicle, x, y):
             continue
 
-        record_drain(start_wh - vehicle.battery.wh(), distance)
+        record_drain(vehicle, start_wh - vehicle.battery.wh(), distance)
 
         report(vehicle, "scanning")
         contacts = sweep(vehicle)
@@ -912,7 +712,7 @@ def run(vehicle, sink=None, rings=3, start_index=None):
         # mined: the rest is work for the other rover, and for this one
         # after the next restart.
         report(vehicle, "surveying")
-        surveyed = []
+        resolved = []
         for contact in contacts:
             if contact.kind() != "mineral":
                 continue
@@ -923,9 +723,9 @@ def run(vehicle, sink=None, rings=3, start_index=None):
                 continue
             found = record_of(fresh)
             remember(found)
-            surveyed.append(found)
+            resolved.append(found)
 
-        target = best_site(vehicle, surveyed, hardness_limit)
+        target = best_site(vehicle, resolved, hardness_limit)
         if target is None:
             continue
 

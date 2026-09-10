@@ -16,6 +16,7 @@ cannot express - see should_rescue().
 
 import bus
 import caps
+from vehicle import DEPART_FRACTION
 
 FLEET_ID = "fleet"
 
@@ -24,7 +25,11 @@ CHARGE_TARGET = 1       # top-up goal for a docked vehicle
 RESCUE_BELOW = 0.15        # dispatch a rescue under this in the field
 RESCUE_TARGET = 0.60       # enough to drive home; a full remote fill is slow
 CRITICAL = 0.08            # charge this vehicle even while conserving power
-DEPART = 0.45              # what a rover needs before it will start a trip
+
+# What a vehicle needs before it will start a trip is the vehicle's own
+# figure, imported rather than written down twice: the station tops a
+# waiting rover to exactly the level the rover then refuses to leave
+# below, so the two numbers are load-bearing together (D-027).
 
 # How stale a rover's own status may be before it is ignored.
 INTENT_MAX_AGE = 30
@@ -51,9 +56,9 @@ def intent_of(vehicle_id):
     """What that vehicle says it is doing, or None if it is not reporting.
 
     Requires the vehicle to be running a script that broadcasts on its
-    rover.status channel. Absence is normal, not an error.
+    vehicle.status channel. Absence is normal, not an error.
     """
-    return bus.read_fresh(bus.rover_channel(vehicle_id), INTENT_MAX_AGE)
+    return bus.read_fresh(bus.vehicle_channel(vehicle_id), INTENT_MAX_AGE)
 
 
 def is_waiting(vehicle) -> bool:
@@ -144,7 +149,7 @@ def charge_docked(station, conserving) -> bool:
         if conserving:
             target = CRITICAL + 0.1     # just enough to be safe, no more
             if is_waiting(vehicle):
-                target = DEPART
+                target = DEPART_FRACTION
             elif vehicle.battery_level >= CRITICAL:
                 continue
 
@@ -196,7 +201,8 @@ def explain_waiting(station, conserving):
         reason = None
         if waiting and not vehicle.is_docked:
             reason = "the outpost does not count it as docked"
-        elif waiting and conserving and vehicle.battery_level >= DEPART:
+        elif (waiting and conserving
+              and vehicle.battery_level >= DEPART_FRACTION):
             reason = "power.mode is conserve and it is already at depart level"
 
         if reason is None:

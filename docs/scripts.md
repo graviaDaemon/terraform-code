@@ -115,8 +115,72 @@ Leave the arguments off — `rover.run(self)` — and everything above is automa
 
 ### `pioneer_1.py`
 
-Empty. The Pioneer has a nav module and a cargo rack, but without Battery Holder
-research it cannot leave the base, so there is nothing useful to automate yet.
+```python
+import scout
+scout.run(self)
+```
+
+The scout rig: Nav, Sonar Module and six Small Battery Holders (300 Wh). Two Pioneers
+rather than one because eight slots will not hold sonar, constructor, cargo and useful
+battery at the same time.
+
+It reports a ranked shortlist of places to put an outpost, and **builds nothing**.
+
+- The first shortlist arrives before the Pioneer moves. `points_of_interest()` hands
+  over coordinates for every permanent map contact for free, and the Journal already
+  holds everything any sonar has ever classified, so the desk survey comes first.
+- Then it drives to the unscanned "?" contacts, nearest first, and only ever to one it
+  can reach and return from. Ring waypoints are filler for when that list runs out.
+- Sweeps that come back `too_hard`, `tier_too_low` or `research_required` are recorded
+  under the Data Archive key `scout.unresolved` with their coordinates. Those are not
+  failures — each is a contact at a known position, which is exactly what makes a later
+  Wide or Deep Sonar trip targeted instead of a re-sweep from scratch.
+- Every candidate reported has been accepted by `plan_structure("outpost", x, y)`, and
+  the unpaid ghost is retracted the moment it comes back `ok`. The clearance radius
+  around an outpost is not documented, so the game is asked rather than modelled.
+- The shortlist goes to `notify()`, the `scout.candidates` bus channel, the Data Archive
+  key `scout.candidates`, and one map marker per candidate when Cartography is present.
+
+Read it back at any time with `get_component("notebook").get("scout.candidates")`.
+
+### `pioneer_2.py`
+
+```python
+import pioneer
+
+OUTPOST_SITE = (-306.6666666666667, -156.66666666666666)
+
+pioneer.found_outpost(OUTPOST_SITE[0], OUTPOST_SITE[1])
+pioneer.run(self)
+```
+
+The constructor rig: Nav, Constructor Module, Small Cargo Rack and five Small Battery
+Holders (250 Wh). It drains the shared construction queue forever — load what the job
+asks for, drive out, park, build, come home and charge.
+
+- It knows nothing about outposts. Every job carries its own `.required_item` and
+  `.required_count`, and those fields — never `.kind` — say what to load. The same loop
+  covers pipes, power lines, bridges, drills and deconstruction with no new code.
+- `OUTPOST_SITE` is the power annex from the scout's shortlist: the closest of the two
+  legal `power`-purpose candidates, 344 m out on the coast. For solar the geology does
+  not matter, so the ranking that does is legal, close and with room to grow — every
+  10 m is one more power-line segment to carry when that line gets built.
+- Founding is simply the first job in the queue. `found_outpost` refuses to plan a
+  second outpost while an unbuilt one is queued and says nothing at all once one
+  stands there, so a restart cannot spend a second 15,000 cr kit.
+- The kit has to be *in Pioneer cargo*, not left in base Inventory — the manual names
+  that as the usual reason nothing builds. A shortfall is reported by name at the pad
+  instead of being discovered in the field.
+- Paused work is the first thing read every pass, most-completed first. Stop, power
+  loss, leaving the site or a rescue pauses a job without losing progress or
+  materials, so stopping the script mid-build and restarting it finishes the same job
+  rather than starting a second one.
+- Each outpost's `buildings_used` against `buildings_capacity` is named at startup and
+  whenever it changes. That threshold is soft: it throttles output rather than
+  blocking deployment, which is exactly why it is worth saying out loud.
+
+The scout carries no Constructor Module. If this script is ever run on it, it says so
+and exits instead of idling on a queue it can never work.
 
 ## Industry and freight
 
@@ -164,6 +228,14 @@ half a map away knows to prefer a deposit of the ore an order is waiting for.
 Orders already part-shipped are preferred, because abandoning progress wastes it — and
 for weekly orders it is worse than waste, since everything shipped toward an unfinished
 weekly is lost when the board refreshes.
+
+`PREFER` overrides that ranking when a specific reward is being chased. It matches an
+order id, name, contractor id or name, or reward label — `"vestibule_logistics"` chases
+Vestibule's queue, currently the Power Line Segment recipe. All three contractors show
+their current order at the same time, so a named one is available immediately; the dock
+will clear, eject and reassign a campaign order mid-flight to get to it, and the units
+already shipped to the order it leaves stay credited. Set `PREFER = None` to hand the
+choice back to the scoring function.
 
 ## Biology
 

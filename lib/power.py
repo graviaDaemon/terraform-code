@@ -10,6 +10,11 @@ The panel it runs on keeps tracking the sun through lib/solar.py.
 The budget is "Wh needed to reach dawn", from a measured night load and
 night length kept in the Data Archive (D-003). Terraforming machines,
 solar panels and batteries are never touched (D-002).
+
+It supervises ONE grid - the one its own panel sits on - not the planet
+(D-019). Generation, storage and demand pool across a connected subnet
+and stop dead at its edge, so an outpost that is not wired to this one is
+energy this base cannot spend and machines whose breakers buy it nothing.
 """
 
 import bio
@@ -66,6 +71,7 @@ state = {
     "empty_wanted_passes": 0,
     "dawn_reported_day": None,
     "warned": {},
+    "grid_machines": None,
 }
 
 
@@ -99,6 +105,7 @@ def _save(key, channel, value):
 
 def default_ledger():
     return {
+        "grid": None,
         "night_hours": DEFAULT_NIGHT_HOURS,
         "day_hours": None,
         "night_load_w": None,
@@ -264,14 +271,112 @@ def publish(mode, summary, need, hours):
     bus.publish(bus.POWER_MODE, published)
 
 
+# --- the grid this supervisor is on -------------------------------------
+
+def resolve_grid(control, gen):
+    """The PowerGrid this panel sits on, or None.
+
+    None is a normal answer, not an error: grid() returns None for a
+    mobile, under-construction, non-grid or currently unmapped target.
+    """
+    return control.grid(gen.id)
+
+
+def grid_anchor(grid):
+    """The grid's anchor id, or None when there is no grid to name."""
+    if grid is None:
+        return None
+    return grid.anchor_id
+
+
+def supply(control, grid):
+    """The figures to budget from: this grid's, or a planet-wide fallback.
+
+    control.total() is "a planet-wide PowerSummary across every
+    independent grid". With one grid that is right by accident; the
+    moment a second outpost exists and is not yet wired, it pools solar
+    and batteries this base physically cannot reach into the night budget
+    and skips conserving on a night it should have (D-019). Both objects
+    carry the same generated/consumed/net/stored/capacity fields, so
+    every reader below takes either one.
+    """
+    if grid is not None:
+        return grid
+    _warn_once("power_grid", "Power: power_control.grid() does not place"
+                             " this panel on a grid - budgeting from the"
+                             " planet-wide total, which pools every outpost"
+                             " whether it is wired to this one or not")
+    return control.total()
+
+
+def scope_to(grid):
+    """Limit machines_of() to `grid`'s machines. None means no limit."""
+    if grid is None:
+        state["grid_machines"] = None
+    else:
+        state["grid_machines"] = grid.machine_ids
+
+
+def on_grid(machine_id) -> bool:
+    """True when this machine shares the supervisor's grid.
+
+    A machine on another grid is not sheddable relief: its breaker costs
+    this subnet nothing, because its draw was never funded from here.
+    """
+    scope = state["grid_machines"]
+    if scope is None:
+        return True
+    return machine_id in scope
+
+
+def other_grids(control, anchor):
+    """Every grid this supervisor is not managing, named and described."""
+    others = []
+    for grid in control.grids():
+        if grid.anchor_id == anchor:
+            continue
+        generation = "has a generator"
+        if not grid.has_generator:
+            generation = "no generator"
+        others.append(f"{grid.anchor_id} ({generation})")
+    return others
+
+
+def watch_grids(control, anchor, seen):
+    """Name the grids this supervisor is NOT managing, when that changes.
+
+    An unwired outpost is a separate subnet whose energy this base cannot
+    reach and whose machines it cannot relieve. It should be a line in
+    the log, not a silence.
+    """
+    others = other_grids(control, anchor)
+    if others == seen["others"]:
+        return
+    seen["others"] = others
+    where = anchor
+    if where is None:
+        where = "planet-wide fallback"
+    if len(others) == 0:
+        notify(f"Power: supervising {where} - 1 grid, 0 unmanaged")
+        return
+    notify(f"Power: supervising {where} - {len(others)} unmanaged grid(s): "
+           + ", ".join(others), "warn")
+
+
 # --- breakers -----------------------------------------------------------
 
 def machines_of(type_ids):
-    """[(id, type_id)] across every outpost, in the order of `type_ids`."""
+    """[(id, type_id)] on THIS grid, in the order of `type_ids`.
+
+    caps.buildings() spans every outpost, so without the grid filter the
+    supervisor would flip breakers on machines that are not on its subnet
+    and get no relief from doing so.
+    """
     found = []
     for type_id in type_ids:
         for ref in caps.buildings(type_id):
-            found.append((ref.id, type_id))
+            if on_grid(ref.id):
+                found.append((ref.id, type_id))
     return found
 
 
@@ -375,17 +480,31 @@ def _warn_once(machine_id, text):
 
 
 def smelter_idle(smelter):
-    inputs = smelter.get_recipe_inputs()
-    if len(inputs) == 0:
+    """True only when NOTHING this smelter could convert is to be had.
+
+    A smelter with no recipe set is never judged idle (D-007): it has no
+    inputs, so "no bin holds any input" would be vacuously true and its
+    breaker could never come back.
+
+    Every unlocked recipe is tested, not just the latched one. The recipe
+    is chosen at runtime from live demand now, and judging the latched
+    one alone deadlocks: a smelter that latches titanium with no titanium
+    ore in the bins is switched off, and its own script - the only thing
+    that would ever re-read demand and switch back - is paused with it
+    (D-028). Staying powered whenever there is anything to convert is
+    also the safe direction of the two.
+    """
+    if len(smelter.get_recipe_inputs()) == 0:
         return None
     if smelter.is_running():
         return False
     if smelter.get_input_count() > 0 or smelter.get_output_count() > 0:
         return False
     sources = storage.discover(machine=smelter) + [storage.INVENTORY]
-    for item_id in inputs:
-        if storage.source_for(sources, item_id, 1) is not None:
-            return False
+    for recipe in smelter.list_recipes():
+        for item_id in recipe.inputs:
+            if storage.source_for(sources, item_id, 1) is not None:
+                return False
     return True
 
 
@@ -483,7 +602,26 @@ def run(gen, interval=INTERVAL):
 
     ledger = load_ledger()
     record = load_shed()
+
+    grid = resolve_grid(control, gen)
+    scope_to(grid)
+    anchor = grid_anchor(grid)
+    grids = {"others": None}
+    watch_grids(control, anchor, grids)
+
+    # The measured night load describes one grid. Say so when it starts
+    # describing a different one, rather than quietly averaging the two
+    # across a rewire.
+    if anchor is not None:
+        if ledger["grid"] is not None and ledger["grid"] != anchor:
+            notify(f"Power: the ledger was measured on grid {ledger['grid']}"
+                   f" but this panel is now on {anchor} - its night load will"
+                   f" re-average onto the merged grid", "warn")
+        ledger["grid"] = anchor
+        save_ledger(ledger)
+
     caps.report("Power supervisor online", caps.common() + [
+        ("grid", anchor if anchor is not None else "planet-wide fallback"),
         ("nights measured", ledger["nights"]),
         ("to restore", len(record)),
         ("unmanaged types", unmanaged_types()),
@@ -496,7 +634,11 @@ def run(gen, interval=INTERVAL):
         solar.track_sun(gen, clock)
         solar.check_output(gen, clock)
 
-        summary = control.total()
+        grid = resolve_grid(control, gen)
+        scope_to(grid)
+        watch_grids(control, grid_anchor(grid), grids)
+
+        summary = supply(control, grid)
         account(ledger, summary, clock)
 
         phase = state["phase"]

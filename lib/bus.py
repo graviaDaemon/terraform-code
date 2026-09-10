@@ -22,14 +22,15 @@ HEATER_TABLE = "terraform.heater_table"   # broadcast: {thermal_state: watts}
 LAB_STATUS = "bio.lab.status"        # heartbeat from the Bio Lab
 COLLECTOR_STATUS = "bio.collector.status"
 EXCHANGE_STATUS = "bio.exchange.status"
-ROVER_STATUS = "rover.status"        # prefix: "rover.status:<rover_id>"
+VEHICLE_STATUS = "vehicle.status"    # prefix: "vehicle.status:<vehicle_id>"
 ROVER_CLAIM = "rover.claim"          # prefix: "rover.claim:<site_id>" = rover id, fresh 10 min
 EARTH_DEMAND = "earth.demand"        # broadcast: {item_id: units still owed}
+SCOUT_CANDIDATES = "scout.candidates"     # broadcast: ranked outpost shortlist
 
 
-def rover_channel(rover_id) -> str:
-    """Per-vehicle status channel, e.g. "rover.status:rover_1"."""
-    return ROVER_STATUS + ":" + rover_id
+def vehicle_channel(vehicle_id) -> str:
+    """Per-vehicle status channel, e.g. "vehicle.status:rover_1"."""
+    return VEHICLE_STATUS + ":" + vehicle_id
 
 
 def claim_channel(site_id) -> str:

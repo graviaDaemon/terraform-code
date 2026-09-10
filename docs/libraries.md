@@ -1,6 +1,6 @@
 # Library reference
 
-Twenty-one in-game Libraries. Machine scripts import them by name; libraries import each
+Twenty-three in-game Libraries. Machine scripts import them by name; libraries import each
 other the same way. No library ever touches `self` — the machine is passed in.
 
 Functions prefixed with `_` are internal and omitted here.
@@ -16,6 +16,8 @@ Functions prefixed with `_` are internal and omitted here.
 [power](#libpowerpy) · [fleet](#libfleetpy) · [vehicle](#libvehiclepy) ·
 [rover](#libroverpy) · [scout](#libscoutpy) · [pioneer](#libpioneerpy) ·
 [smelting](#libsmeltingpy) · [dock](#libdockpy)
+
+**Control Room** — [readout](#libreadoutpy) · [dash](#libdashpy)
 
 ---
 
@@ -689,3 +691,86 @@ that is where material already spent is sitting.
 | `found_outpost(x, y)` | Queue the outpost ghost and return its blueprint id. Planning needs no vehicle at the site. Refuses while an unbuilt outpost is queued and says nothing once one stands there, so a restart cannot spend a second kit. |
 | `capacity_line()` / `watch_capacity()` | Each outpost's `buildings_used` against its soft threshold, said at startup and whenever it changes. The threshold throttles output rather than blocking deployment, which is why it is worth naming. |
 | `run(pioneer, interval=10)` | Build whatever is queued, forever. A Pioneer with no Constructor Module says so and stops rather than idling on a queue it can never work. |
+
+---
+
+## `lib/readout.py`
+
+What the Control Room cards read, as plain dicts. No drawing — `dash` is the other
+half. Everything comes back already merged, already aged and already grouped by
+outpost, so a card is a layout and nothing else.
+
+Two rules run through the file. **Discovery is cached, values are not**: a card is a
+`while True` loop at ten ticks a second against a per-tick step budget, so the building
+walk runs about every five seconds while `output()`, `efficiency()`, progress and
+battery are read on every call. **The bus is never trusted blind**: switching a machine
+off pauses its script, so a shed machine's channel keeps its last value while nothing is
+publishing. Every bus read here is aged, and the caller is handed `stale` rather than a
+value that merely looks current.
+
+Nothing names a machine or an outpost. Machines are found with `caps.buildings(type_id)`,
+which walks the whole network, so production moving to its own outpost needs no edit.
+
+| Function | Purpose |
+| --- | --- |
+| `refresh(force=False)` | Re-walk the building graph when the cadence says so, and take one duty sample. `True` when it ran. Every other function calls it first, so a card never has to. |
+| `clock_line()` | `day`, `hh`, `mm`, `phase`, `elevation`, `game_hours`. |
+| `power()` | Every grid's generation, consumption, net and storage, plus `mode`, `shed`, `need_wh` and `hours_to_dawn` from the supervisor. `supervised` is `False` when nothing is publishing — without that flag, a silent supervisor and a base with nothing shed look identical. |
+| `atmos()` | The three pillars in layout order, each with `level`, `extra` (surface °C, heat only), `rate`, mean `efficiency`, and a `machines` list carrying tier, degraded and powered. `level` is `None` when that pillar's sensor is unrepaired. |
+| `production()` | Every smelter, fabricator, refiner, feed maker and fuel assembler found anywhere, ordered by outpost then name, with `recipe`, `progress`, `rate`, `duty`, buffers and a `state` of `producing` / `idle` / `no recipe` / `off`. |
+| `vehicles()` | The engine's `VehicleRef` facts merged with our own bus intent — `state`, `target`, `cargo`, `job` — and a `stale` flag when that channel has aged out. |
+| `orders()` | Each Supply Dock, its Earth Order, per-item `shipped` against `required`, dispatch rate and whether the dispatcher is enabled. |
+| `alerts()` | Everything wanting the operator, worst first, each `{severity, text}`. Rebuilt on the refresh cadence rather than every tick. The one function here with no canvas in mind: a notifier could use it unchanged. |
+
+`rate` is the recipe's nameplate — `output_count / duration_game_hours`, what the machine
+would do if it never ran dry. `duty` is the share of the last ~5 minutes it was actually
+running. They are always shown together because the nameplate alone lies exactly when it
+matters: a smelter starved of ore reports its full rate at near-zero duty.
+
+## `lib/dash.py`
+
+Layout and formatting for Control Room cards. Nothing here reads the game.
+
+`panel` is a script-owner local, so it does not exist inside a library — every helper
+takes it as its first argument. That is also why this library is `dash` and not `panel`:
+a Library name is shadowed by a local of the same name, and every card has that local.
+
+A box is a plain dict of `x`/`y`/`w`/`h`, so a layout can be sliced and passed around
+without a class.
+
+### Layout
+
+| Function | Purpose |
+| --- | --- |
+| `box(x, y, w, h)` | The rectangle dict every layout helper speaks in. |
+| `frame(panel, title)` | Draw the card's outer frame; return the content box inside. Sized from `width()`/`height()`, so a card set to another size reflows instead of painting off-canvas. |
+| `columns(area, count, gap)` | `count` equal-width column boxes. |
+| `rows(area, height, gap, top)` | Row boxes down `area` — only as many as fit, which is what lets a card say "+3 more" instead of painting over its own footer. |
+| `inset(area, left, top, right, bottom)` | `area` with each edge pulled in. |
+
+### Text and formatting
+
+| Function | Purpose |
+| --- | --- |
+| `text_w(text, size)` / `chars_for(width, size)` | Monospace width in pixels, and its inverse. |
+| `trim(text, chars)` / `fit(text, width, size)` | Cut to a character count or a pixel width, ending in `..`. Nothing clips for us: an untrimmed string paints straight over the next column. |
+| `num(value, places)` | Fixed precision without a pointless trailing `.0`. |
+| `pct(fraction)` / `pct_of_100(value)` | A 0-1 fraction, or a reading the game already scales 0-100, as a percentage. |
+| `rate(value, unit)` · `wh(value)` · `watts(value)` · `coords(x, y)` · `hhmm(h, m)` | The recurring readouts. `wh` switches to kWh once the number stops being readable; `watts` is signed, so a grid losing ground reads negative. |
+
+### Status and drawing
+
+| Function | Purpose |
+| --- | --- |
+| `dot_for(state)` | Any state any publisher in this base uses, mapped onto the four words `status_dot` knows. |
+| `severity_dot(severity)` / `severity_color(severity)` | The same for an alert severity — a separate mapping, because `warning` is not a verb and `dot_for` would read it as "running" and paint it green. |
+| `color_for(fraction, invert)` | Traffic-light colour, thresholded in one place. `invert` for readings where high is the bad end. |
+| `heading` / `note` / `kv` / `meter` / `empty` / `overflow` | The composites every card is built from. `meter` clamps and tolerates a missing reading; `overflow` paints the `+N more` line. |
+
+### History
+
+| Function | Purpose |
+| --- | --- |
+| `history_new(size)` | A fixed-length ring buffer for `spark_line`. A factory, not module state: a library's scope is shared by every importing script, so one buffer here would have five cards interleaving samples into a single series. |
+| `history_push(store, value, stamp)` | Append, dropping the oldest when full. `stamp` throttles — pass a game hour and a card repainting ten times a second still samples once an hour. |
+| `history_values(store)` / `spark(panel, ...)` | The samples, and the trend line — which says "collecting history" rather than leaving an unexplained gap while there are fewer than two. |

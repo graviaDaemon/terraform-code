@@ -7,6 +7,10 @@ loop and only the machine differs.
 `self` is the machine the script runs inside. It exists only in a machine script,
 never in a library, which is why every library takes the machine as an argument.
 
+Control Room cards are the exception: a card has no `self` at all. It gets `panel`
+instead, and the same rule applies — `panel` is a script local, so `lib/dash.py` takes
+it as an argument.
+
 - [Terraforming](#terraforming)
 - [Power](#power)
 - [Vehicles](#vehicles)
@@ -15,6 +19,7 @@ never in a library, which is why every library takes the machine as an argument.
 - [Surface survey](#surface-survey)
 - [Sensors and one-shots](#sensors-and-one-shots)
 - [Contract puzzles](#contract-puzzles)
+- [Control Room cards](#control-room-cards)
 
 ## Terraforming
 
@@ -321,3 +326,69 @@ they generalise.
 | `sealed_vault.py` | Walk the maze, remembering the opposite of each move so a dead end can be backtracked, and escape at the exit. |
 | `terminal_breach.py` | Fifteen digits, each 1–5, with correct/misplaced feedback. Establishes a baseline from a uniform guess, then solves position by position. |
 | `xenogenetics.py` | Diff the sample list against the Earth reference and transmit what is not on it. |
+
+## Control Room cards
+
+Five script-driven panels on the Control Room page, one script per card. A card is not a
+machine script: it has no `self`, so no machine action works from it (`set_recipe`,
+`move_to`, `set_power` are all unavailable). It gets `panel` instead, repaints every
+tick, and reads through `lib/readout.py` and draws through `lib/dash.py`.
+
+Cards *can* command through the shared authorities — `power_control`, `shop`, `comms`,
+`inventory`, `atmosphere` — but none of these do. `lib/power.py` is the single owner of
+breakers and restores its own shed record after a restart; a card toggling the same
+breaker would be a second writer on that concern and the two would fight. An operator
+override belongs on a bus channel the supervisor reads, not on a card reaching for the
+breaker behind its back.
+
+Every card draws from `panel.width()` / `panel.height()` rather than a fixed span, so one
+set to a different size reflows instead of painting off the canvas.
+
+### `panel_2.py` — STATUS
+
+2×1 (wide). Is anything wrong right now? Day, wall clock, daylight phase and a sun-
+elevation dial on the left; the power budget in the middle — mode pill, stored bar, net
+watts, hours to dawn; the alert stack on the right. An empty right-hand column is the
+point of the card: it means nothing needs the operator.
+
+When `power.budget` has aged out the middle column says **supervisor silent** rather than
+showing a mode. The shed record is empty whether the supervisor is quiet or has nothing
+shed, so reporting "nothing shed" there would be a guess dressed as a reading.
+
+### `panel_3.py` — TERRAFORM
+
+2×2 (big). Three columns, one per pillar: oxygen, pressure, heat. Each shows the current
+level, the summed production rate per hour, a dial of mean efficiency, one row per
+machine with its Mk tier and efficiency, and a trend line of the level along the bottom.
+
+A pillar whose sensor is unrepaired says so instead of printing a zero. The trend is
+sampled once per game hour — the card repaints ten times a second, which would otherwise
+fill the buffer with five seconds of history and draw it as a trend.
+
+### `panel_4.py` — PRODUCTION
+
+2×1 (wide). One row per smelter, fabricator, refiner, feed maker or fuel assembler found
+anywhere, under an outpost heading. Recipe, state, progress, rate, duty and buffers.
+
+The outpost heading is there even while there is only one outpost, because the day
+smelting moves to its own base this card grows a second group and needs no edit. Rate and
+duty are always shown together: the rate is the recipe's nameplate, duty is the share of
+the last few minutes the machine was actually running, and a smelter starved of ore
+reports a full rate at near-zero duty.
+
+### `panel_5.py` — FLEET
+
+2×1 (wide). One row per rover and Pioneer: state, target, battery, cargo or job, and
+position.
+
+The engine's `fleet.vehicles()` is the hard fact — position, battery, docked, stranded.
+The Signal Bus adds the intent only that vehicle's own script knows. A vehicle whose
+channel has aged out keeps the engine's word and is marked `stale`; it is never shown a
+stale verb, because a script that stopped and a rover that is genuinely idle look
+identical otherwise.
+
+### `panel_6.py` — EARTH
+
+1×1 (small). The first Supply Dock's Earth Order: name, contractor, a bar per required
+item with shipped against required, and a footer with dispatch rate and whether the
+dispatcher is running. Further docks are counted, not crammed.
